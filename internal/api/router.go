@@ -83,6 +83,7 @@ func NewRouter(
 
 	apiV1 := appGroup.Group("/api/v1")
 	apiV1.Use(unauthenticatedLoginRequestLimits(basePath))
+	apiV1.Use(apiSecurityLimits())
 	apiV1.Use(requestIntentMiddleware())
 	if debugAPIRoutesEnabled() {
 		registerPingRoutes(apiV1)

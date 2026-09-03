@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+umask 077
+
 ensure_writable_dir() {
   dir="$1"
   if [ -z "$dir" ]; then
@@ -11,6 +13,12 @@ ensure_writable_dir() {
 }
 
 work_dir="${WORK_DIR:-./data}"
+case "$work_dir" in
+  ""|/)
+    echo "WORK_DIR must not be empty or /" >&2
+    exit 1
+    ;;
+esac
 ensure_writable_dir "$work_dir"
 
 case "${BACKUP_ENABLED:-true}" in

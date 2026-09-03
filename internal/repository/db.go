@@ -98,6 +98,12 @@ func OpenDatabase(cfg config.Config) (*gorm.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database %s: %w", filepath.Clean(cfg.SQLitePath), err)
 	}
+	if databasePath, ok := sqliteDatabaseFilesystemPath(cfg.SQLitePath); ok {
+		if err := os.Chmod(databasePath, 0o600); err != nil {
+			closeDatabasePool(db)
+			return nil, fmt.Errorf("restrict sqlite database permissions %s: %w", filepath.Clean(databasePath), err)
+		}
+	}
 	// GORM 已经创建底层连接池；后续任一初始化步骤失败都必须在返回前统一回收。
 	closeOnError := true
 	defer func() {
@@ -124,6 +130,14 @@ func OpenDatabase(cfg config.Config) (*gorm.DB, error) {
 	// 文件库的独立 reader 依赖 WAL；内存库不支持 WAL，继续沿用原来的单池 memory journal 语义。
 	if !sqliteDatabaseRequiresSinglePool(cfg.SQLitePath) && !strings.EqualFold(strings.TrimSpace(journalMode), "wal") {
 		return nil, fmt.Errorf("enable sqlite WAL: journal mode is %q", journalMode)
+	}
+	if databasePath, ok := sqliteDatabaseFilesystemPath(cfg.SQLitePath); ok {
+		for _, suffix := range []string{"-wal", "-shm"} {
+			path := databasePath + suffix
+			if err := os.Chmod(path, 0o600); err != nil && !os.IsNotExist(err) {
+				return nil, fmt.Errorf("restrict sqlite sidecar permissions %s: %w", filepath.Clean(path), err)
+			}
+		}
 	}
 	if err := db.Exec("PRAGMA busy_timeout=5000").Error; err != nil {
 		return nil, fmt.Errorf("set sqlite busy timeout: %w", err)
@@ -278,6 +292,28 @@ func sqliteDatabaseRequiresSinglePool(path string) bool {
 	// 命名 URI 的 mode=memory 同样属于内存库；解析失败留给 DSN 构造函数返回明确错误。
 	query, err := url.ParseQuery(rawQuery)
 	return err == nil && strings.EqualFold(strings.TrimSpace(query.Get("mode")), "memory")
+}
+
+func sqliteDatabaseFilesystemPath(path string) (string, bool) {
+	if sqliteDatabaseRequiresSinglePool(path) {
+		return "", false
+	}
+	filename, _, _ := strings.Cut(strings.TrimSpace(path), "?")
+	if strings.HasPrefix(strings.ToLower(filename), "file:") {
+		parsed, err := url.Parse(filename)
+		if err != nil || parsed.Scheme != "file" || parsed.Host != "" {
+			return "", false
+		}
+		filename = parsed.Path
+		if len(filename) >= 3 && filename[0] == '/' && filename[2] == ':' {
+			filename = filename[1:]
+		}
+	}
+	filename = filepath.FromSlash(filename)
+	if strings.TrimSpace(filename) == "" {
+		return "", false
+	}
+	return filename, true
 }
 
 // sqliteDatabaseFileExists 判断磁盘数据库文件是否存在；内存库和空路径都按新库处理。

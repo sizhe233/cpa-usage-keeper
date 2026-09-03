@@ -56,6 +56,31 @@ func TestOpenDatabaseAutoMigratesCoreTables(t *testing.T) {
 	}
 }
 
+func TestOpenDatabaseRestrictsSQLiteFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose POSIX file modes")
+	}
+	dbPath := filepath.Join(t.TempDir(), "app.db")
+	db, err := repository.OpenDatabase(config.Config{SQLitePath: dbPath})
+	if err != nil {
+		t.Fatalf("OpenDatabase returned error: %v", err)
+	}
+	closeTestDatabase(t, db)
+
+	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) && path != dbPath {
+				continue
+			}
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("expected %s mode 0600, got %04o", filepath.Base(path), got)
+		}
+	}
+}
+
 func TestOpenDatabaseCreatesFreshDatabaseFromCurrentSchemaWithoutRunningMigrations(t *testing.T) {
 	logs := captureRepositoryLogs(t)
 	dbPath := filepath.Join(t.TempDir(), "app.db")

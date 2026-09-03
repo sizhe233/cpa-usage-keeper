@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +50,40 @@ func TestConfigureWritesLogrusToDailyFile(t *testing.T) {
 	}
 	if !logLineHasTimestamp(content) {
 		t.Fatalf("expected log file to include timestamp, got %q", content)
+	}
+}
+
+func TestConfigureRestrictsLogDirectoryAndFilePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose POSIX file modes")
+	}
+	reset := captureGlobalLogState(t)
+	defer reset()
+
+	root := t.TempDir()
+	logDir := filepath.Join(root, "logs")
+	closer, err := Configure(config.Config{LogLevel: "info", LogFileEnabled: true, LogDir: logDir, LogRetentionDays: 7})
+	if err != nil {
+		t.Fatalf("Configure returned error: %v", err)
+	}
+	logrus.Info("permission check")
+	if err := closer.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	dirInfo, err := os.Stat(logDir)
+	if err != nil {
+		t.Fatalf("stat log directory: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("expected log directory mode 0700, got %04o", got)
+	}
+	fileInfo, err := os.Stat(filepath.Join(logDir, logFilePrefix+time.Now().Format("2006-01-02")+".log"))
+	if err != nil {
+		t.Fatalf("stat log file: %v", err)
+	}
+	if got := fileInfo.Mode().Perm(); got != 0o600 {
+		t.Fatalf("expected log file mode 0600, got %04o", got)
 	}
 }
 
