@@ -301,10 +301,13 @@ func sqliteDatabaseFilesystemPath(path string) (string, bool) {
 	filename, _, _ := strings.Cut(strings.TrimSpace(path), "?")
 	if strings.HasPrefix(strings.ToLower(filename), "file:") {
 		parsed, err := url.Parse(filename)
-		if err != nil || parsed.Scheme != "file" || parsed.Host != "" {
+		if err != nil || parsed.Scheme != "file" || (parsed.Host != "" && !strings.EqualFold(parsed.Host, "localhost")) {
 			return "", false
 		}
 		filename = parsed.Path
+		if filename == "" {
+			filename = strings.TrimPrefix(parsed.Opaque, "//")
+		}
 		if len(filename) >= 3 && filename[0] == '/' && filename[2] == ':' {
 			filename = filename[1:]
 		}

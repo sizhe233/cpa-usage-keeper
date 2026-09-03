@@ -13,12 +13,13 @@ ensure_writable_dir() {
 }
 
 work_dir="${WORK_DIR:-./data}"
-case "$work_dir" in
-  ""|/)
-    echo "WORK_DIR must not be empty or /" >&2
-    exit 1
-    ;;
-esac
+mkdir -p "$work_dir"
+work_dir_resolved="$(cd "$work_dir" && pwd -P)"
+if [ "$work_dir_resolved" = "/" ]; then
+  echo "WORK_DIR must not resolve to /" >&2
+  exit 1
+fi
+work_dir="$work_dir_resolved"
 ensure_writable_dir "$work_dir"
 
 case "${BACKUP_ENABLED:-true}" in

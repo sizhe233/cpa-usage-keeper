@@ -307,6 +307,9 @@ func newDailyFileWriterWithPrefix(dir, prefix string, retentionDays int, now fun
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create log dir: %w", err)
 	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("restrict log dir permissions: %w", err)
+	}
 	if err := writer.rotateLocked(now()); err != nil {
 		return nil, err
 	}

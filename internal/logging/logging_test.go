@@ -62,6 +62,9 @@ func TestConfigureRestrictsLogDirectoryAndFilePermissions(t *testing.T) {
 
 	root := t.TempDir()
 	logDir := filepath.Join(root, "logs")
+	if err := os.Mkdir(logDir, 0o755); err != nil {
+		t.Fatalf("create legacy log directory: %v", err)
+	}
 	closer, err := Configure(config.Config{LogLevel: "info", LogFileEnabled: true, LogDir: logDir, LogRetentionDays: 7})
 	if err != nil {
 		t.Fatalf("Configure returned error: %v", err)
