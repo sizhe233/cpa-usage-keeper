@@ -11,6 +11,7 @@ import (
 
 const (
 	unauthenticatedLoginBodyLimit   int64 = 4 << 10
+	authenticatedJSONBodyLimit      int64 = 1 << 20
 	unauthenticatedLoginReadTimeout       = 15 * time.Second
 )
 
@@ -45,6 +46,23 @@ func unauthenticatedLoginRequestLimits(basePath string) gin.HandlerFunc {
 			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, unauthenticatedLoginBodyLimit)
 		}
 
+		c.Next()
+	}
+}
+
+func apiSecurityLimits() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		setNoStoreHeaders(c)
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("Referrer-Policy", "no-referrer")
+		if c.Request.Body != nil && requiresRequestIntent(c.Request.Method) {
+			if c.Request.ContentLength > authenticatedJSONBodyLimit {
+				writeRequestEntityTooLarge(c)
+				c.Abort()
+				return
+			}
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, authenticatedJSONBodyLimit)
+		}
 		c.Next()
 	}
 }

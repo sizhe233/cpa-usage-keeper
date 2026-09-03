@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -54,6 +55,41 @@ func TestHealthzRemainsPublicWhenAuthEnabled(t *testing.T) {
 
 	if resp.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestAPIV1ResponsesDisableCaching(t *testing.T) {
+	router := NewRouter(nil, nil, nil, nil, AuthConfig{}, nil, "")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if got := resp.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("expected API no-store cache policy, got %q", got)
+	}
+	if got := resp.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("expected API nosniff header, got %q", got)
+	}
+	if got := resp.Header().Get("Referrer-Policy"); got != "no-referrer" {
+		t.Fatalf("expected API no-referrer policy, got %q", got)
+	}
+}
+
+func TestAPIV1RejectsOversizedMutatingBodies(t *testing.T) {
+	router := NewRouter(nil, nil, nil, nil, AuthConfig{}, nil, "")
+	body := strings.NewReader(strings.Repeat("x", int(authenticatedJSONBodyLimit)+1))
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/usage/api-keys/1", body)
+	req.Header.Set(requestIntentHeaderName, requestIntentHeaderValueFetch)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413, got %d body=%s", resp.Code, resp.Body.String())
 	}
 }
 
