@@ -24,6 +24,12 @@ import {
 import { useScrollBoundaryContainment } from '@/hooks/useScrollBoundaryContainment'
 import type { UsageEvent } from '@/lib/types'
 import { calculateCacheReadRate, formatCompactTokenValue, formatDurationMs, formatUsd } from '@/utils/usage'
+import {
+  buildUsageModelTooltipLines,
+  getUsageModelDisplay,
+  getUsageModelTooltip,
+  type UsageModelTooltip,
+} from '@/utils/usage/modelDisplay'
 import { RequestEventResultBadge } from '@/components/usage/RequestEventResultBadge'
 import styles from './CredentialRequestEventsList.module.scss'
 
@@ -59,7 +65,9 @@ interface CredentialRequestEventRow {
   requestTier: string
   responseTier: string
   model: string
+  responseModel: string
   modelAlias: string
+  modelTooltip: UsageModelTooltip
   reasoningEffort: string
   requestType: string
   endpoint: string
@@ -237,6 +245,63 @@ function CredentialRequestEventsCacheMetric({
   )
 }
 
+function CredentialRequestEventsModelCell({
+  row,
+  tooltipLines,
+  tooltipActions,
+  upstreamResponseLabel,
+}: {
+  row: CredentialRequestEventRow
+  tooltipLines: string[]
+  tooltipActions: OverflowTooltipActions
+  upstreamResponseLabel: string
+}) {
+  const cellRef = useRef<HTMLTableCellElement | null>(null)
+
+  useEffect(() => {
+    const cell = cellRef.current
+    return () => {
+      if (!cell) return
+      // 虚拟行卸载时同步清理整格 Tooltip，避免浮层保留已不存在的锚点。
+      tooltipActions.hideOnMouseLeave(cell)
+      tooltipActions.hideOnBlur(cell)
+    }
+  }, [tooltipActions])
+
+  const interactive = tooltipLines.length > 0
+
+  return (
+    <td
+      ref={cellRef}
+      className={`${styles.stackedCell} ${styles.model}`.trim()}
+      data-credential-request-model={row.id}
+      tabIndex={interactive ? 0 : undefined}
+      aria-label={interactive ? tooltipLines.join('; ') : undefined}
+      onMouseEnter={interactive
+        ? (event) => tooltipActions.showOnMouseEnter(tooltipLines, event.currentTarget)
+        : undefined}
+      onMouseLeave={interactive
+        ? (event) => tooltipActions.hideOnMouseLeave(event.currentTarget)
+        : undefined}
+      onFocus={interactive
+        ? (event) => tooltipActions.showOnFocus(tooltipLines, event.currentTarget)
+        : undefined}
+      onBlur={interactive
+        ? (event) => tooltipActions.hideOnBlur(event.currentTarget)
+        : undefined}
+    >
+      <strong>{row.model}</strong>
+      {row.responseModel ? (
+        <small className={styles.responseModel}>
+          <span className={styles.responseModelArrow} aria-hidden="true">↳ </span>
+          <span className={styles.responseModelLabel}>{upstreamResponseLabel}:</span> {row.responseModel}
+        </small>
+      ) : null}
+      {row.modelAlias ? <small>{row.modelAlias}</small> : null}
+    </td>
+  )
+}
+
 function CredentialRequestEventsMetricCell({
   className,
   tooltipLines,
@@ -306,6 +371,12 @@ const formatSpeedMode = (value: unknown, t: (key: string) => string): string => 
   return labelKey ? t(labelKey) : normalized
 }
 
+const formatSpeedModeDetailValue = (value: unknown, t: (key: string) => string): string => {
+  const rawValue = optionalText(value)
+  const displayValue = formatSpeedMode(rawValue, t)
+  return rawValue === '-' ? displayValue : `${displayValue} (${rawValue})`
+}
+
 const formatSpeed = (value: unknown): string => {
   const speed = Number(value)
   return Number.isFinite(speed) && speed > 0 ? `${speed.toFixed(1)} t/s` : '-'
@@ -341,6 +412,19 @@ const buildCredentialRequestCacheTooltipLines = (
   formatCredentialRequestMetricTooltipLine(t('usage_stats.cache_creation_tokens'), row.cacheCreationTokensFull, t),
 ]
 
+const buildCredentialRequestModelTooltipLines = (
+  row: CredentialRequestEventRow,
+  t: (key: string, options?: Record<string, string>) => string,
+): string[] => buildUsageModelTooltipLines(
+  row.modelTooltip,
+  {
+    model: t('usage_stats.model_name'),
+    responseModel: t('usage_stats.upstream_response_model'),
+    modelAlias: t('usage_stats.model_alias'),
+  },
+  (label, value) => formatCredentialRequestMetricTooltipLine(label, value, t),
+)
+
 const optionalText = (value: unknown): string => String(value ?? '').trim() || '-'
 
 const parseRequestEndpoint = (rawEndpoint: unknown): { requestType: string; endpoint: string } => {
@@ -361,8 +445,8 @@ const buildRow = (
   t: (key: string) => string,
 ): CredentialRequestEventRow => {
   const timestamp = String(event.timestamp ?? '')
-  const model = String(event.model ?? '').trim() || '-'
-  const modelAliasValue = String(event.model_alias ?? '').trim()
+  const modelDisplay = getUsageModelDisplay(event.model, event.response_model, event.model_alias)
+  const modelTooltip = getUsageModelTooltip(event.model, event.response_model, event.model_alias)
   const endpoint = parseRequestEndpoint(event.endpoint)
   const latencyMs = Number.isFinite(event.latency_ms) ? event.latency_ms : null
   const ttftMs = Number.isFinite(event.ttft_ms) ? event.ttft_ms as number : null
@@ -370,8 +454,8 @@ const buildRow = (
   const inputTokens = toNumber(event.tokens?.input_tokens)
   const cacheReadTokens = toNumber(event.tokens?.cache_read_tokens)
   const apiKey = optionalText(event.api_key)
-  const requestTier = formatSpeedMode(event.service_tier, t)
-  const responseTier = formatSpeedMode(event.response_service_tier, t)
+  const requestTier = formatSpeedModeDetailValue(event.service_tier, t)
+  const responseTier = formatSpeedModeDetailValue(event.response_service_tier, t)
   const executorType = optionalText(event.executor_type)
   const clientIP = optionalText(event.client_ip)
   const xForwardedFor = optionalText(event.x_forwarded_for)
@@ -385,7 +469,7 @@ const buildRow = (
 
   return {
     event,
-    id: String(event.id ?? '').trim() || `${timestamp}-${model}-${index}`,
+    id: String(event.id ?? '').trim() || `${timestamp}-${modelDisplay.model}-${index}`,
     requestId: String(event.request_id ?? '').trim(),
     detailsId: `credential-request-event-details-${index}`,
     timestamp,
@@ -394,9 +478,11 @@ const buildRow = (
     apiKey,
     requestTier,
     responseTier,
-    model,
-    modelAlias: modelAliasValue && modelAliasValue !== model ? modelAliasValue : '-',
-    reasoningEffort: optionalText(event.reasoning_effort),
+    model: modelDisplay.model,
+    responseModel: modelDisplay.responseModel,
+    modelAlias: modelDisplay.modelAlias,
+    modelTooltip,
+    reasoningEffort: String(event.reasoning_effort ?? '').trim(),
     requestType: endpoint.requestType,
     endpoint: endpoint.endpoint,
     failed: event.failed === true,
@@ -422,7 +508,7 @@ const buildRow = (
     clientIP,
     xForwardedFor,
     userAgent,
-    canExpand: [apiKey, requestTier, responseTier, executorType, clientIP, xForwardedFor, userAgent]
+    canExpand: [requestTier, responseTier, executorType, clientIP, xForwardedFor, userAgent]
       .some((value) => value !== '-'),
   }
 }
@@ -575,9 +661,9 @@ export function CredentialRequestEventsList({
 
   const renderLabeledOverflowText = (label: string, value: string) => renderOverflowText(
     'small',
-    `${label} ${value}`,
+    `${label}: ${value}`,
     <>
-      <span className={styles.subDataLabel} data-credential-request-sub-label>{label}</span>
+      <span className={styles.subDataLabel} data-credential-request-sub-label>{label}:</span>
       {' '}{value}
     </>,
   )
@@ -588,6 +674,7 @@ export function CredentialRequestEventsList({
     const expanded = expandedRowId === row.id
     const tokenTooltipLines = buildCredentialRequestTokenTooltipLines(row, t)
     const cacheTooltipLines = buildCredentialRequestCacheTooltipLines(row, t)
+    const modelTooltipLines = buildCredentialRequestModelTooltipLines(row, t)
     return (
       <tbody
         key={row.id}
@@ -637,18 +724,23 @@ export function CredentialRequestEventsList({
             )}
           </td>
           <td
-            className={`${styles.stackedCell} ${styles.model}`.trim()}
-            data-credential-request-model={row.id}
+            className={`${styles.stackedCell} ${styles.apiKey}`.trim()}
+            data-credential-request-api-key={row.id}
           >
-            {renderOverflowText('strong', row.model)}
-            {renderOverflowText('small', row.modelAlias)}
-            {renderLabeledOverflowText(t('usage_stats.reasoning_effort'), row.reasoningEffort)}
+            {renderOverflowText('strong', row.apiKey)}
           </td>
-          <td className={`${styles.stackedCell} ${styles.request}`.trim()}>
+          <CredentialRequestEventsModelCell
+            row={row}
+            tooltipLines={modelTooltipLines}
+            tooltipActions={tooltipActions}
+            upstreamResponseLabel={t('usage_stats.upstream_response_model')}
+          />
+          <td className={styles.stackedCell}>
             {renderOverflowText('strong', row.requestType)}
-            {renderOverflowText('small', row.endpoint)}
+            {row.endpoint !== '-' ? renderLabeledOverflowText(t('usage_stats.request_endpoint'), row.endpoint) : null}
+            {row.reasoningEffort ? renderLabeledOverflowText(t('usage_stats.reasoning_effort'), row.reasoningEffort) : null}
           </td>
-          <td className={styles.resultColumn}>
+          <td>
             <RequestEventResultBadge
               failed={row.failed}
               loading={logLoading}
@@ -725,15 +817,11 @@ export function CredentialRequestEventsList({
             className={styles.detailRow}
             data-credential-request-event-details={row.id}
           >
-            <td colSpan={8}>
+            <td colSpan={9}>
               <div className={styles.detailLayout}>
                 <section className={styles.detailGroup} data-credential-request-detail-group="request">
                   <h4>{t('usage_stats.credentials_detail_request_context')}</h4>
                   <div className={styles.detailGrid}>
-                    <div className={styles.detailItem} data-credential-request-detail-item>
-                      <span>{t('usage_stats.api_key_filter')}</span>
-                      {renderOverflowText('strong', row.apiKey)}
-                    </div>
                     <div className={styles.detailItem} data-credential-request-detail-item>
                       <span>{t('usage_stats.credentials_detail_request_tier')}</span>
                       {renderOverflowText('strong', row.requestTier)}
@@ -787,13 +875,14 @@ export function CredentialRequestEventsList({
           <thead>
             <tr>
               <th className={styles.timestamp}>{t('usage_stats.request_events_timestamp')}</th>
+              <th className={styles.apiKey}>{t('usage_stats.api_key_filter')}</th>
               <th className={styles.model}>{t('usage_stats.model_name')}</th>
-              <th className={styles.request}>{t('usage_stats.request_type')}</th>
-              <th className={styles.resultColumn}>{t('usage_stats.request_events_result')}</th>
-              <th className={styles.tokens}>{t('usage_stats.total_tokens')}</th>
+              <th>{t('usage_stats.request_type')}</th>
+              <th>{t('usage_stats.request_events_result')}</th>
+              <th className={styles.tokens}>{t('usage_stats.request_events_tokens')}</th>
               <th className={styles.cache}>{t('usage_stats.credentials_detail_cache_column')}</th>
               <th className={styles.performance}>{t('usage_stats.latency')}</th>
-              <th className={styles.cost}>{t('usage_stats.total_cost')}</th>
+              <th className={styles.cost}>{t('usage_stats.request_events_cost')}</th>
             </tr>
           </thead>
           {virtualizeRows ? (
@@ -801,7 +890,7 @@ export function CredentialRequestEventsList({
               {virtualPaddingTop > 0 ? (
                 <tbody aria-hidden="true">
                   <tr className={styles.virtualSpacerRow} style={{ height: `${virtualPaddingTop}px` }} aria-hidden="true" data-credential-request-events-spacer>
-                    <td colSpan={8} />
+                    <td colSpan={9} />
                   </tr>
                 </tbody>
               ) : null}
@@ -809,7 +898,7 @@ export function CredentialRequestEventsList({
               {virtualPaddingBottom > 0 ? (
                 <tbody aria-hidden="true">
                   <tr className={styles.virtualSpacerRow} style={{ height: `${virtualPaddingBottom}px` }} aria-hidden="true" data-credential-request-events-spacer>
-                    <td colSpan={8} />
+                    <td colSpan={9} />
                   </tr>
                 </tbody>
               ) : null}

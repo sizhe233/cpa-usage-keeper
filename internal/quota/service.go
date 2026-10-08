@@ -19,6 +19,7 @@ import (
 
 type ServiceOptions struct {
 	RefreshWorkerLimit               int
+	QuotaUpstreamResponsesEnabled    bool
 	UsageHeaderSnapshotFlushInterval time.Duration
 	// CodexQuotaHistoryFlushInterval 覆盖独立历史 runner 固定批次边界前的一分钟等待，主要供定向测试缩短等待。
 	CodexQuotaHistoryFlushInterval time.Duration
@@ -33,9 +34,13 @@ type Service struct {
 	db       *gorm.DB
 	registry ProviderRegistry
 	pricing  *pricing.Catalog
+	// quotaUpstreamResponsesEnabled 控制刷新任务是否把 CPA 转发的完整上游响应写入最新限额缓存。
+	quotaUpstreamResponsesEnabled bool
 
 	refreshMu    sync.Mutex
 	refreshTasks map[string]*RefreshTaskRecord
+	// nextRefreshTaskCleanupAt 由 refreshMu 保护，只限制读取接口的全量清理频率。
+	nextRefreshTaskCleanupAt time.Time
 	// resetInFlight 按 auth_index 记录正在消费的 reset credit，避免并发重复扣减官方次数。
 	resetMu       sync.Mutex
 	resetInFlight map[string]struct{}
@@ -87,6 +92,8 @@ type Service struct {
 	codexQuotaHistoryTrustedQueue chan codexQuotaHistoryInput
 	// codexQuotaHistoryTrustedWake 让可信来源跳过 Header 一分钟窗口并立即触发 runner。
 	codexQuotaHistoryTrustedWake chan struct{}
+	// 删除命令与采样共用唯一 runner，避免事务提交后旧缓存继续写回。
+	codexQuotaHistoryDelete chan codexQuotaHistoryDeleteRequest
 	// codexQuotaHistoryStopCh 只表达 runner 停止；队列不关闭以避免并发发送 panic。
 	codexQuotaHistoryStopCh chan struct{}
 	// codexQuotaHistoryDoneCh 在 shutdown best-effort flush 完成后关闭。
@@ -118,17 +125,21 @@ type CheckRequest struct {
 }
 
 type CheckResponse struct {
-	ID                                  string            `json:"id"`
-	Quota                               []QuotaRow        `json:"quota"`
-	Subscription                        *SubscriptionInfo `json:"subscription,omitempty"`
-	RateLimitResetCreditsAvailableCount *int              `json:"rateLimitResetCreditsAvailableCount,omitempty"`
+	ID                                  string                  `json:"id"`
+	Quota                               []QuotaRow              `json:"quota"`
+	Subscription                        *SubscriptionInfo       `json:"subscription,omitempty"`
+	RateLimitResetCreditsAvailableCount *int                    `json:"rateLimitResetCreditsAvailableCount,omitempty"`
+	ClaudeResetGrants                   *ClaudeResetGrantStatus `json:"claudeResetGrants,omitempty"`
 }
 
-func NewService(db *gorm.DB, caller ManagementAPICaller, pricingCatalog *pricing.Catalog) *Service {
+func NewService(db *gorm.DB, caller ManagementClient, pricingCatalog *pricing.Catalog) *Service {
 	return NewServiceWithOptions(db, caller, ServiceOptions{PricingCatalog: pricingCatalog})
 }
 
-func NewServiceWithOptions(db *gorm.DB, caller ManagementAPICaller, options ServiceOptions) *Service {
+func NewServiceWithOptions(db *gorm.DB, caller ManagementClient, options ServiceOptions) *Service {
+	if options.QuotaUpstreamResponsesEnabled {
+		caller = upstreamResponseRecordingCaller{ManagementClient: caller}
+	}
 	return NewServiceWithRegistryAndOptions(db, NewDefaultProviderRegistry(caller, DefaultProviderConfigs()), options)
 }
 
@@ -172,6 +183,7 @@ func NewServiceWithRegistryAndOptions(db *gorm.DB, registry ProviderRegistry, op
 		db:                                 db,
 		registry:                           registry,
 		pricing:                            pricingCatalog,
+		quotaUpstreamResponsesEnabled:      options.QuotaUpstreamResponsesEnabled,
 		refreshTasks:                       make(map[string]*RefreshTaskRecord),
 		resetInFlight:                      make(map[string]struct{}),
 		refreshWorkerTokens:                make(chan struct{}, workerLimit),
@@ -190,13 +202,14 @@ func NewServiceWithRegistryAndOptions(db *gorm.DB, registry ProviderRegistry, op
 		codexQuotaHistoryHeaderWake:        make(chan struct{}, 1),
 		codexQuotaHistoryTrustedQueue:      make(chan codexQuotaHistoryInput, codexHistoryQueueSize),
 		codexQuotaHistoryTrustedWake:       make(chan struct{}, 1),
+		codexQuotaHistoryDelete:            make(chan codexQuotaHistoryDeleteRequest),
 		codexQuotaHistoryStopCh:            make(chan struct{}),
 		codexQuotaHistoryDoneCh:            make(chan struct{}),
 		codexQuotaHistoryFlushInterval:     codexHistoryFlushInterval,
 		codexQuotaHistoryHeartbeatInterval: codexHistoryHeartbeatInterval,
 		codexQuotaHistoryNewTimer:          newCodexQuotaHistoryTimer,
 		codexQuotaHistoryWrite:             repository.WriteCodexMainQuotaObservations,
-		codexQuotaHistoryLoad:              repository.LoadLatestCodexQuotaHistoryState,
+		codexQuotaHistoryLoad:              repository.LoadLatestQuotaHistoryState,
 		codexQuotaHistoryListIdentities:    repository.ListActiveAuthFileUsageIdentitiesByAuthIndexes,
 	}
 	go service.runUsageHeaderSnapshotWorker()
@@ -282,32 +295,74 @@ func (s *Service) StopRefreshTasks() {
 }
 
 func (s *Service) Check(ctx context.Context, request CheckRequest) (CheckResponse, error) {
+	response, _, _, err := s.checkWithUpstreamResponses(ctx, request, nil)
+	return response, err
+}
+
+// beforeSubscriptionDone 只用于刷新 worker：额度到达后先补窗口统计，再等待可选订阅查询收尾。
+func (s *Service) checkWithUpstreamResponses(ctx context.Context, request CheckRequest, beforeSubscriptionDone func(CheckResponse) CheckResponse) (CheckResponse, []UpstreamResponse, bool, error) {
+	if !s.quotaUpstreamResponsesEnabled {
+		response, statsAttached, err := s.check(ctx, request, beforeSubscriptionDone)
+		return response, nil, statsAttached, err
+	}
+	collectorContext, collector := withUpstreamResponseCollector(ctx)
+	response, statsAttached, err := s.check(collectorContext, request, beforeSubscriptionDone)
+	return response, collector.snapshot(), statsAttached, err
+}
+
+func (s *Service) check(ctx context.Context, request CheckRequest, beforeSubscriptionDone func(CheckResponse) CheckResponse) (CheckResponse, bool, error) {
 	// 单条查询以 auth_index 为唯一入口，前端不需要知道具体 provider 的 API 细节。
 	authIndex := strings.TrimSpace(request.AuthIndex)
 	if authIndex == "" {
-		return CheckResponse{}, fmt.Errorf("%w: auth_index is required", ErrValidation)
+		return CheckResponse{}, false, fmt.Errorf("%w: auth_index is required", ErrValidation)
 	}
 	// 只允许 auth files 身份查询限额，AI provider 身份不进入 provider 调用链路。
 	identity, err := repository.GetActiveAuthFileUsageIdentityByAuthIndex(ctx, s.db, authIndex)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return CheckResponse{}, fmt.Errorf("%w: %s", ErrNotFound, authIndex)
+			return CheckResponse{}, false, fmt.Errorf("%w: %s", ErrNotFound, authIndex)
 		}
-		return CheckResponse{}, err
+		return CheckResponse{}, false, err
 	}
 	// 按相邻项目规则先匹配 provider 再匹配 type，解析出实际要调用的 quota handler。
 	_, handler, ok := s.resolveQuotaHandlerForIdentity(identity)
 	if !ok {
-		return CheckResponse{}, fmt.Errorf("%w: %s", ErrUnsupportedType, normalizeIdentityType(identity.Provider))
+		return CheckResponse{}, false, fmt.Errorf("%w: %s", ErrUnsupportedType, normalizeIdentityType(identity.Provider))
+	}
+	var subscriptionDone <-chan *time.Time
+	var cancelSubscription context.CancelFunc
+	if (request.Source == RefreshSourceManual || request.Source == RefreshSourceScheduled) && usageHeaderIdentityIsCodex(identity) {
+		if codex, ok := handler.(interface {
+			FetchSubscriptionActiveUntil(context.Context, ProviderInput) *time.Time
+		}); ok && optionalAccountID(identity.AccountID) != "" {
+			// 两路沿用同一个任务 deadline；额度失败时取消并等待订阅 goroutine 退出。
+			subscriptionContext, cancel := context.WithCancel(ctx)
+			cancelSubscription = cancel
+			results := make(chan *time.Time, 1)
+			subscriptionDone = results
+			go func() {
+				results <- codex.FetchSubscriptionActiveUntil(subscriptionContext, ProviderInput{Identity: identity})
+			}()
+		}
+	}
+	if cancelSubscription != nil {
+		defer cancelSubscription()
 	}
 	// provider 返回各自原始结构后，再统一转换为前端可复用的 quota rows。
 	providerOutput, err := handler.Check(ctx, ProviderInput{Identity: identity})
 	if err != nil {
-		return CheckResponse{}, err
+		if subscriptionDone != nil {
+			cancelSubscription()
+			<-subscriptionDone
+		}
+		return CheckResponse{}, false, err
 	}
-	// 主动查询只从原始 CodexResult 提取 Primary/Secondary；Review/Additional 从结构上不参与遍历。
-	if usageHeaderIdentityIsCodex(identity) {
-		observations := BuildCodexMainQuotaObservations(authIndex, providerOutput, time.Now())
+	// 主动查询只从真实 provider 的账号主窗口提取可信观察；其它窗口不参与历史。
+	if provider := normalizeIdentityType(identity.Type); provider == "codex" || provider == "claude" {
+		observations := BuildMainQuotaObservations(authIndex, providerOutput, time.Now())
+		if len(observations) > 0 && observations[0].Provider != provider {
+			observations = nil
+		}
 		if len(observations) > 0 && !s.tryAppendCodexQuotaHistoryObservations(observations, request.Source) {
 			// history 是 best-effort 统计链路，队列满或 shutdown 不能改变手动/定时/巡检刷新结果。
 			logrus.WithFields(logrus.Fields{
@@ -321,6 +376,9 @@ func (s *Service) Check(ctx context.Context, request CheckRequest) (CheckRespons
 		Quota:        NormalizeQuotaRows(providerOutput),
 		Subscription: NormalizeSubscription(providerOutput),
 	}
+	if result, ok := providerOutput.Result.(ClaudeResult); ok && result.Usage != nil {
+		response.ClaudeResetGrants = result.Usage.ResetGrants
+	}
 	// 实时结果没有套餐时仅允许回退当前 Identity metadata；现在只有 Codex 具备该来源。
 	if response.Subscription == nil {
 		response.Subscription = ResolveIdentitySubscription(identity)
@@ -329,7 +387,20 @@ func (s *Service) Check(ctx context.Context, request CheckRequest) (CheckRespons
 	if count, ok := rateLimitResetCreditsAvailableCount(providerOutput); ok {
 		response.RateLimitResetCreditsAvailableCount = count
 	}
-	return response, nil
+	statsAttached := false
+	if subscriptionDone != nil {
+		if beforeSubscriptionDone != nil {
+			response = beforeSubscriptionDone(response)
+			statsAttached = true
+		}
+		if activeUntil := <-subscriptionDone; activeUntil != nil && ctx.Err() == nil {
+			// 官方结果直接写入当前账号；在途请求若遇到账号切换则由 WHERE 保护。
+			if err := repository.UpdateCodexUsageIdentityActiveUntil(ctx, s.db, identity, *activeUntil); err != nil {
+				logrus.WithError(err).WithField("auth_index", authIndex).Warn("codex subscription expiry update skipped")
+			}
+		}
+	}
+	return response, statsAttached, nil
 }
 
 func (s *Service) resolveQuotaHandler(provider string, identityType string) (string, ProviderHandler, bool) {

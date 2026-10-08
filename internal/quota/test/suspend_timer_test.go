@@ -5,43 +5,37 @@ import (
 	"time"
 )
 
-func TestSuspendAwareTimerZeroDelayFiresImmediately(t *testing.T) {
-	ch, stop, err := newSuspendAwareTimer(0)
-	if err != nil {
-		t.Fatalf("unexpected error for 0 delay: %v", err)
-	}
-	defer stop()
-
-	select {
-	case <-ch:
-	case <-time.After(time.Second):
-		t.Fatal("expected 0 delay timer to fire immediately")
-	}
-}
-
-func TestSuspendAwareTimerFiresAfterDelay(t *testing.T) {
-	start := time.Now()
-	ch, stop, err := newSuspendAwareTimer(50 * time.Millisecond)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer stop()
-
-	select {
-	case <-ch:
-		elapsed := time.Since(start)
-		if elapsed < 40*time.Millisecond {
-			t.Fatalf("timer fired too early: %v", elapsed)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected timer to fire after delay")
+func TestSuspendAwareTimerDelivers(t *testing.T) {
+	for _, delay := range []time.Duration{0, 50 * time.Millisecond} {
+		t.Run(delay.String(), func(t *testing.T) {
+			start := time.Now()
+			ch, stop, err := newSuspendAwareTimer(delay)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stop()
+			select {
+			case <-ch:
+				if elapsed := time.Since(start); elapsed < delay-10*time.Millisecond {
+					t.Fatalf("timer fired too early: %v", elapsed)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timer did not fire")
+			}
+		})
 	}
 }
 
-func TestSuspendAwareTimerStopPreventsLeak(t *testing.T) {
-	_, stop, err := newSuspendAwareTimer(10 * time.Second)
+func TestSuspendAwareTimerStopCancelsDelivery(t *testing.T) {
+	ch, stop, err := newSuspendAwareTimer(time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	stop()
+
+	select {
+	case <-ch:
+		t.Fatal("expected stopped timer not to deliver an event")
+	case <-time.After(1250 * time.Millisecond):
+	}
 }

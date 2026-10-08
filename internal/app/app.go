@@ -200,15 +200,17 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 
 	cpaClient := cpa.NewClient(cfg.CPABaseURL, cfg.CPAManagementKey, cfg.RequestTimeout, cfg.TLSSkipVerify)
 	quotaService := quota.NewServiceWithOptions(db, cpaClient, quota.ServiceOptions{
-		RefreshWorkerLimit: cfg.QuotaRefreshWorkerLimit,
-		PricingCatalog:     pricingCatalog,
+		RefreshWorkerLimit:            cfg.QuotaRefreshWorkerLimit,
+		QuotaUpstreamResponsesEnabled: cfg.QuotaUpstreamResponsesEnabled,
+		PricingCatalog:                pricingCatalog,
 	})
 	// 单 writer aggregation runner 只维护 rollups/Identity，并在 App.Run 时主动追平。
 	usageAggregationRunner := poller.NewUsageAggregationRunner(db)
 	// syncService 仍然是 metadata 和 usage 处理共享的业务服务入口。
 	syncService := service.NewSyncServiceWithOptions(db, service.SyncServiceOptions{
-		BaseURL: cfg.CPABaseURL,
-		Client:  cpaClient,
+		UsageRawRetentionDays: cfg.UsageRawRetentionDays,
+		BaseURL:               cfg.CPABaseURL,
+		Client:                cpaClient,
 		// usage_events 事务提交后通过这个缓存做非阻塞增量追加，供 Overview realtime 和右边界补偿复用。
 		RecentUsageEvents: recentUsageCache,
 		// usage 与 metadata 提交后只唤醒单 writer runner，不在前台链路执行派生聚合。
@@ -304,7 +306,11 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 		OnDisplayNameChanged: quotaService.UpdateUsageIdentityDisplayNameSnapshot,
 	})
 	cpaAPIKeyService := service.NewCPAAPIKeyService(db)
-	authFilesManagementService := service.NewAuthFilesManagementService(cpaClient)
+	// 单条凭证开关成功后立即与 CPA 对齐；runner 自带合并窗口和 nil 保护。
+	credentialMutationLocks := &service.CredentialMutationLocks{}
+	authFilesManagementService := service.NewAuthFilesManagementService(cpaClient, credentialMutationLocks)
+	credentialStatusService := service.NewCredentialStatusService(db, cpaClient, metadataSyncRunner, credentialMutationLocks)
+	credentialPriorityService := service.NewCredentialPriorityService(db, cpaClient, metadataSyncRunner, credentialMutationLocks)
 	if cfg.TLSSkipVerify {
 		logrus.WithField("cpa_base_url", cfg.CPABaseURL).Warn("TLS certificate verification is disabled for CPA and Redis queue connections")
 	}
@@ -361,9 +367,12 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 				Quota:         quotaService,
 				CPAAPIKeys:    cpaAPIKeyService,
 				AuthFiles:     authFilesManagementService,
-				RequestLogs:   requestLogService,
-				Ranking:       rankingService,
-				LocalRanking:  localRankingService,
+				// 认证文件与 AI 供应商共用一个 service，路由层按类型分发。
+				CredentialStatus:   credentialStatusService,
+				CredentialPriority: credentialPriorityService,
+				RequestLogs:        requestLogService,
+				Ranking:            rankingService,
+				LocalRanking:       localRankingService,
 				Status: api.StatusRouteConfig{
 					CPAPublicURL:               cfg.CPAPublicURL,
 					CPARequestLogAccessEnabled: cfg.CPARequestLogAccessEnabled,

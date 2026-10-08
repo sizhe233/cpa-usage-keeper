@@ -288,6 +288,21 @@ func TestNormalizeAntigravityQuotaRowsScopesDuplicateBucketIDsByStableGroup(t *t
 	}
 }
 
+func TestNormalizeAntigravityQuotaRowsCanonicalizesKnownGroupLabelVariants(t *testing.T) {
+	remaining := 0.5
+	rows := quota.NormalizeQuotaRows(quota.ProviderOutput{Provider: "antigravity", Result: quota.AntigravityResult{Quota: &quota.AntigravityQuotaPayload{Groups: []quota.AntigravityQuotaGroup{
+		{DisplayName: "Gemini models", Buckets: []quota.AntigravityQuotaBucket{{BucketID: "gemini", Window: "5h", RemainingFraction: &remaining}}},
+		{DisplayName: "Claude & GPT Models", Buckets: []quota.AntigravityQuotaBucket{{BucketID: "claude-gpt", Window: "5h", RemainingFraction: &remaining}}},
+	}}}})
+
+	if len(rows) != 2 {
+		t.Fatalf("expected two canonical Antigravity groups, got %#v", rows)
+	}
+	if rows[0].GroupKey != "antigravity-gemini-models" || rows[1].GroupKey != "antigravity-claude-and-gpt-models" {
+		t.Fatalf("expected display-name variants to use canonical usage group keys, got %#v", rows)
+	}
+}
+
 func TestNormalizeKimiQuotaRows(t *testing.T) {
 	rows := quota.NormalizeQuotaRows(quota.ProviderOutput{Provider: "kimi", Result: quota.KimiResult{Usage: &quota.KimiUsagePayload{
 		Usage: &quota.KimiUsageDetail{Used: 3, Limit: 10, Remaining: 7, Name: "monthly", Title: "Monthly", ResetAt: "2026-05-09T12:00:00Z", ResetIn: 3600},
@@ -415,38 +430,31 @@ func TestNormalizeXAIProductRowsUsesStableKeysDeduplicationAndSorting(t *testing
 	}
 }
 
-func TestNormalizeXAIDerivesPayAsYouGoUsageFromTotalSpend(t *testing.T) {
-	rows := quota.NormalizeQuotaRows(quota.ProviderOutput{Provider: "xai", Result: quota.XAIResult{
-		Monthly: &quota.XAIBillingPayload{Config: &quota.XAIBillingConfig{
-			MonthlyLimit: quota.XAIMoneyValue{Val: floatPtr(1000)},
-			Used:         quota.XAIMoneyValue{Val: floatPtr(1300)},
-			OnDemandCap:  quota.XAIMoneyValue{Val: floatPtr(500)},
-		}},
-	}})
-
-	monthly := findQuotaRow(t, rows, "billing.monthly")
-	if monthly.LimitReached == nil || *monthly.LimitReached {
-		t.Fatalf("monthly included spend must remain allowed while PAYG is available: %#v", monthly)
-	}
-	onDemand := findQuotaRow(t, rows, "billing.on_demand")
-	assertFloatField(t, onDemand.Used, 300, "derived pay-as-you-go used")
-	assertFloatField(t, onDemand.Remaining, 200, "derived pay-as-you-go remaining")
-	assertFloatField(t, onDemand.UsedPercent, 60, "derived pay-as-you-go usedPercent")
-}
-
-func TestNormalizeXAIQuotaRowsMarksPayAsYouGoExhaustion(t *testing.T) {
-	rows := quota.NormalizeQuotaRows(quota.ProviderOutput{Provider: "xai", Result: quota.XAIResult{
-		Monthly: &quota.XAIBillingPayload{Config: &quota.XAIBillingConfig{
-			MonthlyLimit: quota.XAIMoneyValue{Val: floatPtr(1000)},
-			Used:         quota.XAIMoneyValue{Val: floatPtr(1500)},
-			OnDemandCap:  quota.XAIMoneyValue{Val: floatPtr(500)},
-		}},
-	}})
-
-	monthly := findQuotaRow(t, rows, "billing.monthly")
-	onDemand := findQuotaRow(t, rows, "billing.on_demand")
-	if monthly.LimitReached == nil || !*monthly.LimitReached || onDemand.LimitReached == nil || !*onDemand.LimitReached {
-		t.Fatalf("expected exhausted included and PAYG rows to be limit reached: %#v", rows)
+func TestNormalizeXAIDerivesPayAsYouGoUsageAndExhaustion(t *testing.T) {
+	for _, tc := range []struct {
+		name                            string
+		total, used, remaining, percent float64
+		exhausted                       bool
+	}{
+		{"available", 1300, 300, 200, 60, false},
+		{"exhausted", 1500, 500, 0, 100, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := quota.NormalizeQuotaRows(quota.ProviderOutput{Provider: "xai", Result: quota.XAIResult{
+				Monthly: &quota.XAIBillingPayload{Config: &quota.XAIBillingConfig{
+					MonthlyLimit: quota.XAIMoneyValue{Val: new(float64(1000))},
+					Used:         quota.XAIMoneyValue{Val: &tc.total},
+					OnDemandCap:  quota.XAIMoneyValue{Val: new(float64(500))},
+				}},
+			}})
+			monthly := findQuotaRow(t, rows, "billing.monthly")
+			onDemand := findQuotaRow(t, rows, "billing.on_demand")
+			assertBoolField(t, monthly.LimitReached, tc.exhausted, "monthly exhausted")
+			assertBoolField(t, onDemand.LimitReached, tc.exhausted, "PAYG exhausted")
+			assertFloatField(t, onDemand.Used, tc.used, "derived PAYG used")
+			assertFloatField(t, onDemand.Remaining, tc.remaining, "derived PAYG remaining")
+			assertFloatField(t, onDemand.UsedPercent, tc.percent, "derived PAYG usedPercent")
+		})
 	}
 }
 
