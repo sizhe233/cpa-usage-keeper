@@ -83,7 +83,7 @@ func TestAPIV1ResponsesDisableCaching(t *testing.T) {
 
 func TestAPIV1RejectsOversizedMutatingBodies(t *testing.T) {
 	router := NewRouter(nil, nil, nil, nil, AuthConfig{}, nil, "")
-	body := strings.NewReader(strings.Repeat("x", int(authenticatedJSONBodyLimit)+1))
+	body := strings.NewReader(strings.Repeat("x", int((1<<20))+1))
 	req := httptest.NewRequest(http.MethodPatch, "/api/v1/usage/api-keys/1", body)
 	req.Header.Set(requestIntentHeaderName, requestIntentHeaderValueFetch)
 	resp := httptest.NewRecorder()

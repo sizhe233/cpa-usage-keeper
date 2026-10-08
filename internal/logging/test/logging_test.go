@@ -86,7 +86,7 @@ func TestConfigureRestrictsLogDirectoryAndFilePermissions(t *testing.T) {
 	if got := dirInfo.Mode().Perm(); got != 0o700 {
 		t.Fatalf("expected log directory mode 0700, got %04o", got)
 	}
-	fileInfo, err := os.Stat(filepath.Join(logDir, logFilePrefix+time.Now().Format("2006-01-02")+".log"))
+	fileInfo, err := os.Stat(filepath.Join(logDir, "cpa-usage-keeper-"+time.Now().Format("2006-01-02")+".log"))
 	if err != nil {
 		t.Fatalf("stat log file: %v", err)
 	}
