@@ -8,6 +8,7 @@ import (
 	"unsafe"
 
 	"cpa-usage-keeper/internal/quota"
+	"cpa-usage-keeper/internal/repository"
 	repositorydto "cpa-usage-keeper/internal/repository/dto"
 
 	"gorm.io/gorm"
@@ -28,6 +29,14 @@ func quotaRowUsageWindow(row quota.QuotaRow, now time.Time) (time.Time, time.Tim
 
 //go:linkname attachWindowUsageStats cpa-usage-keeper/internal/quota.(*Service).attachWindowUsageStats
 func attachWindowUsageStats(service *quota.Service, ctx context.Context, authIndex string, response quota.CheckResponse, now time.Time) quota.CheckResponse
+
+type usageWindowStatsProvider interface {
+	SumByAuthIndex(context.Context, string, time.Time, *time.Time) (repository.UsageWindowStats, error)
+	SumGroupsByAuthIndex(context.Context, string, time.Time, *time.Time, repository.UsageWindowStatsGrouper) (repository.UsageWindowGroupedStats, error)
+}
+
+//go:linkname attachWindowUsageStatsWithProvider cpa-usage-keeper/internal/quota.(*Service).attachWindowUsageStatsWithProvider
+func attachWindowUsageStatsWithProvider(service *quota.Service, ctx context.Context, authIndex string, response quota.CheckResponse, now time.Time, statsProvider usageWindowStatsProvider) quota.CheckResponse
 
 //go:linkname applyUsageHeaderSnapshot cpa-usage-keeper/internal/quota.(*Service).applyUsageHeaderSnapshot
 func applyUsageHeaderSnapshot(service *quota.Service, ctx context.Context, snapshot quota.UsageHeaderSnapshot) bool
@@ -131,10 +140,6 @@ func lastAutoRefreshAttemptAt(service *quota.Service) time.Time {
 	return quotaServiceField(service, "lastAutoRefreshAttemptAt").Interface().(time.Time)
 }
 
-func usageHeaderFlushInterval(service *quota.Service) time.Duration {
-	return quotaServiceField(service, "usageHeaderFlushInterval").Interface().(time.Duration)
-}
-
 func setUsageHeaderTimerFactory(service *quota.Service, factory func(time.Duration) (<-chan time.Time, func())) {
 	quotaServiceField(service, "usageHeaderNewTimer").Set(reflect.ValueOf(factory))
 }
@@ -160,7 +165,7 @@ func setCodexQuotaHistoryWriter(service *quota.Service, writer func(context.Cont
 	}))
 }
 
-func setCodexQuotaHistoryLoader(service *quota.Service, loader func(context.Context, *gorm.DB, string, string) (repositorydto.CodexQuotaHistoryState, error)) {
+func setCodexQuotaHistoryLoader(service *quota.Service, loader func(context.Context, *gorm.DB, string, string, string) (repositorydto.CodexQuotaHistoryState, error)) {
 	// loader 同样是包内命名函数类型，测试通过反射适配回调并精确统计每批恢复次数。
 	field := quotaServiceField(service, "codexQuotaHistoryLoad")
 	field.Set(reflect.MakeFunc(field.Type(), func(arguments []reflect.Value) []reflect.Value {
@@ -169,6 +174,7 @@ func setCodexQuotaHistoryLoader(service *quota.Service, loader func(context.Cont
 			arguments[1].Interface().(*gorm.DB),
 			arguments[2].Interface().(string),
 			arguments[3].Interface().(string),
+			arguments[4].Interface().(string),
 		)
 		results := []reflect.Value{reflect.ValueOf(state), reflect.Zero(field.Type().Out(1))}
 		if err != nil {

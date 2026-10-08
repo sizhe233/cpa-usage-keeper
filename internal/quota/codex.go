@@ -2,18 +2,22 @@ package quota
 
 import (
 	"context"
+	"net/url"
 	"strings"
+	"time"
 
 	"cpa-usage-keeper/internal/cpa/dto/apicall"
 	"cpa-usage-keeper/internal/entities"
+
+	"github.com/sirupsen/logrus"
 )
 
 type codexProvider struct {
-	caller ManagementAPICaller
+	caller ManagementClient
 	config APICallConfig
 }
 
-func NewCodexProvider(caller ManagementAPICaller, config APICallConfig) ProviderHandler {
+func NewCodexProvider(caller ManagementClient, config APICallConfig) ProviderHandler {
 	return codexProvider{caller: caller, config: config}
 }
 
@@ -38,7 +42,41 @@ func (p codexProvider) Check(ctx context.Context, input ProviderInput) (Provider
 	if err != nil {
 		return ProviderOutput{}, err
 	}
+	// usage 未明确给出 reset credit 数量时，按 CPAMC 的 best-effort 语义补查详情接口；明确 0 不触发额外请求。
+	if usage.RateLimitResetCredits == nil || usage.RateLimitResetCredits.AvailableCount == nil {
+		credits, creditsErr := p.ListResetCredits(ctx, input)
+		if creditsErr == nil {
+			availableCount := credits.AvailableCount
+			// 兼容详情接口只有可用 credit 明细而缺少聚合 count 的响应。
+			if availableCount == nil && len(credits.Credits) > 0 {
+				count := len(credits.Credits)
+				availableCount = &count
+			}
+			if availableCount != nil {
+				count := *availableCount
+				usage.RateLimitResetCredits = &CodexRateLimitResetCredits{AvailableCount: &count}
+			}
+		}
+	}
 	return ProviderOutput{Provider: "codex", Result: CodexResult{Usage: usage}}, nil
+}
+
+// FetchSubscriptionActiveUntil 是主动刷新附带的可选查询；失败不影响已取得的额度。
+func (p codexProvider) FetchSubscriptionActiveUntil(ctx context.Context, input ProviderInput) *time.Time {
+	accountID := optionalAccountID(input.Identity.AccountID)
+	if accountID == "" {
+		return nil
+	}
+	response, err := p.caller.CallManagementAPI(ctx, apicall.Request{
+		AuthIndex: input.Identity.Identity,
+		Method:    "GET",
+		URL:       CodexSubscriptionsURL + "?account_id=" + url.QueryEscape(accountID),
+		Header:    p.requestHeaders(input.Identity),
+	})
+	if err != nil {
+		return nil
+	}
+	return parseCodexSubscriptionActiveUntil(response)
 }
 
 func optionalAccountID(value *string) string {
@@ -66,7 +104,16 @@ func (p codexProvider) Reset(ctx context.Context, input ProviderInput) (Provider
 	if err != nil {
 		return ProviderResetOutput{}, err
 	}
-	return parseCodexResetCreditResponse(response)
+	output, err := parseCodexResetCreditResponse(response)
+	if err != nil {
+		return ProviderResetOutput{}, err
+	}
+	// 官方重置已消费次数；随后清除 CPA 的路由冷却，失败只标记部分成功，避免重复消费。
+	if err := p.caller.ResetQuota(ctx, input.Identity.Identity); err != nil {
+		output.RecoveryFailed = true
+		logrus.WithError(err).WithField("auth_index", input.Identity.Identity).Warn("Codex quota reset succeeded but CPA account recovery failed")
+	}
+	return output, nil
 }
 
 func (p codexProvider) ListResetCredits(ctx context.Context, input ProviderInput) (ProviderResetCreditsOutput, error) {

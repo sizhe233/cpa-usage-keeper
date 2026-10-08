@@ -13,6 +13,7 @@ import (
 
 	"cpa-usage-keeper/internal/cpa"
 	"github.com/joho/godotenv"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -71,6 +72,8 @@ type Config struct {
 	MetadataSyncInterval time.Duration
 	// QuotaRefreshWorkerLimit 是 Auth Files 限额刷新队列的最大并发数。
 	QuotaRefreshWorkerLimit int
+	// QuotaUpstreamResponsesEnabled 控制是否缓存并返回限额查询的原始上游响应。
+	QuotaUpstreamResponsesEnabled bool
 	// WorkDir 是应用工作目录，数据库、日志和备份默认从这里派生。
 	WorkDir string
 	// SQLitePath 是 SQLite 数据库文件路径。
@@ -83,6 +86,8 @@ type Config struct {
 	BackupInterval time.Duration
 	// BackupRetentionDays 是备份文件保留天数。
 	BackupRetentionDays int
+	// UsageRawRetentionDays 是原始请求总保留天数；0 永久保留，仅清理归档表。
+	UsageRawRetentionDays int
 	// RequestTimeout 是访问 CPA HTTP 和 Redis TCP 的超时时间。
 	RequestTimeout time.Duration
 	// TLSSkipVerify 控制是否跳过 CPA HTTPS 和 Redis 队列 TLS 的证书验证。
@@ -162,6 +167,10 @@ func Load(options LoadOptions) (*Config, error) {
 	if quotaRefreshWorkerLimit > QuotaRefreshWorkerLimitMax {
 		return nil, fmt.Errorf("QUOTA_REFRESH_WORKER_LIMIT must be <= %d", QuotaRefreshWorkerLimitMax)
 	}
+	quotaUpstreamResponsesEnabled, err := getBool("QUOTA_UPSTREAM_RESPONSES_ENABLED", false)
+	if err != nil {
+		return nil, err
+	}
 
 	requestTimeout, err := getDuration("REQUEST_TIMEOUT", 30*time.Second)
 	if err != nil {
@@ -187,6 +196,14 @@ func Load(options LoadOptions) (*Config, error) {
 	}
 	if backupRetentionDays < 0 {
 		return nil, fmt.Errorf("BACKUP_RETENTION_DAYS must be non-negative")
+	}
+	usageRawRetentionDays, err := getInt("USAGE_RAW_RETENTION_DAYS", 0)
+	if err != nil {
+		return nil, err
+	}
+	if usageRawRetentionDays != 0 && usageRawRetentionDays < 90 {
+		logrus.WithField("usage_raw_retention_days", usageRawRetentionDays).Warn("unsupported USAGE_RAW_RETENTION_DAYS; using 0 (archived events retained permanently)")
+		usageRawRetentionDays = 0
 	}
 	logFileEnabled, err := getBool("LOG_FILE_ENABLED", true)
 	if err != nil {
@@ -266,12 +283,14 @@ func Load(options LoadOptions) (*Config, error) {
 		RedisQueueIdleInterval:          redisQueueIdleInterval,
 		MetadataSyncInterval:            MetadataSyncIntervalDefault,
 		QuotaRefreshWorkerLimit:         quotaRefreshWorkerLimit,
+		QuotaUpstreamResponsesEnabled:   quotaUpstreamResponsesEnabled,
 		WorkDir:                         workDir,
 		SQLitePath:                      filepath.Join(workDir, workDirDatabaseName),
 		BackupEnabled:                   backupEnabled,
 		BackupDir:                       filepath.Join(workDir, workDirBackupsName),
 		BackupInterval:                  backupInterval,
 		BackupRetentionDays:             backupRetentionDays,
+		UsageRawRetentionDays:           usageRawRetentionDays,
 		RequestTimeout:                  requestTimeout,
 		TLSSkipVerify:                   tlsSkipVerify,
 		LogLevel:                        getString("LOG_LEVEL", "info"),

@@ -9,6 +9,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func suspendAwareTimerParameters(delay time.Duration) (int, int, int, unix.ItimerSpec) {
+	// 使用相对的一次性 CLOCK_BOOTTIME timer，让系统休眠时间计入自动刷新等待周期。
+	return unix.CLOCK_BOOTTIME,
+		unix.TFD_CLOEXEC | unix.TFD_NONBLOCK,
+		0,
+		unix.ItimerSpec{Value: unix.NsecToTimespec(delay.Nanoseconds())}
+}
+
 func newSuspendAwareTimer(delay time.Duration) (<-chan time.Time, func(), error) {
 	if delay <= 0 {
 		ch := make(chan time.Time, 1)
@@ -16,15 +24,13 @@ func newSuspendAwareTimer(delay time.Duration) (<-chan time.Time, func(), error)
 		return ch, func() {}, nil
 	}
 
-	fd, err := unix.TimerfdCreate(unix.CLOCK_BOOTTIME, unix.TFD_CLOEXEC|unix.TFD_NONBLOCK)
+	clockID, createFlags, settimeFlags, spec := suspendAwareTimerParameters(delay)
+	fd, err := unix.TimerfdCreate(clockID, createFlags)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	spec := unix.ItimerSpec{
-		Value: unix.NsecToTimespec(delay.Nanoseconds()),
-	}
-	if err := unix.TimerfdSettime(fd, 0, &spec, nil); err != nil {
+	if err := unix.TimerfdSettime(fd, settimeFlags, &spec, nil); err != nil {
 		_ = unix.Close(fd)
 		return nil, nil, err
 	}

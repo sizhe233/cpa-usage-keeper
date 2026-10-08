@@ -14,16 +14,12 @@ import (
 
 func TestCodexProviderUsesAccountIDForUsageRequest(t *testing.T) {
 	codexUsageJSON := `{"user_id":"user-k7itHYqWm38P92JR13zywJOr","account_id":"user-k7itHYqWm38P92JR13zywJOr","email":"gykrcvk0839e@hotmail.com","plan_type":"plus","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":64,"limit_window_seconds":18000,"reset_after_seconds":11676,"reset_at":1778509871},"secondary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_after_seconds":598476,"reset_at":1779096671}},"code_review_rate_limit":null,"additional_rate_limits":null,"rate_limit_reset_credits":{"available_count":1},"credits":{"has_credits":false,"unlimited":false,"overage_limit_reached":false,"balance":"0","approx_local_messages":[0,0],"approx_cloud_messages":[0,0]},"spend_control":{"reached":false,"individual_limit":null},"rate_limit_reached_type":null,"promo":null,"referral_beacon":null}`
-	caller := &recordingManagementCaller{responses: []*apicall.Response{{
-		StatusCode: 200,
-		BodyText:   codexUsageJSON,
-		Body:       json.RawMessage(codexUsageJSON),
-	}}}
+	caller := &recordingManagementCaller{responses: []*apicall.Response{quotaAPIResponse(200, codexUsageJSON)}}
 	provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
 
 	output, err := provider.Check(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{
 		Identity:  "codex-auth",
-		AccountID: stringPtr("acct_123"),
+		AccountID: new("acct_123"),
 	}})
 	if err != nil {
 		t.Fatalf("Check returned error: %v", err)
@@ -76,7 +72,7 @@ func TestCodexProviderUsesAccountIDForUsageRequest(t *testing.T) {
 	if request.AuthIndex != "codex-auth" || request.Method != "GET" || request.URL != "https://chatgpt.com/backend-api/wham/usage" {
 		t.Fatalf("unexpected api-call request: %+v", request)
 	}
-	if request.Header["Authorization"] != "Bearer $TOKEN$" || request.Header["Content-Type"] != "application/json" || request.Header["User-Agent"] != "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal" || request.Header["Chatgpt-Account-Id"] != "acct_123" {
+	if request.Header["Authorization"] != "Bearer $TOKEN$" || request.Header["Content-Type"] != "application/json" || request.Header["User-Agent"] != "Codex Desktop/0.160.1 (Mac OS 27.0.1; arm64) unknown (Codex Desktop; 26.930.61225)" || request.Header["Chatgpt-Account-Id"] != "acct_123" {
 		t.Fatalf("unexpected api-call headers: %+v", request.Header)
 	}
 	if request.Data != nil {
@@ -86,11 +82,7 @@ func TestCodexProviderUsesAccountIDForUsageRequest(t *testing.T) {
 
 func TestCodexProviderParsesZeroRateLimitResetCredits(t *testing.T) {
 	codexUsageJSON := `{"plan_type":"plus","rate_limit":{"allowed":true,"limit_reached":false},"rate_limit_reset_credits":{"available_count":0}}`
-	caller := &recordingManagementCaller{responses: []*apicall.Response{{
-		StatusCode: 200,
-		BodyText:   codexUsageJSON,
-		Body:       json.RawMessage(codexUsageJSON),
-	}}}
+	caller := &recordingManagementCaller{responses: []*apicall.Response{quotaAPIResponse(200, codexUsageJSON)}}
 	provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
 
 	output, err := provider.Check(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{Identity: "codex-auth"}})
@@ -107,15 +99,59 @@ func TestCodexProviderParsesZeroRateLimitResetCredits(t *testing.T) {
 	if *result.Usage.RateLimitResetCredits.AvailableCount != 0 {
 		t.Fatalf("expected zero reset credits available count, got %#v", result.Usage.RateLimitResetCredits.AvailableCount)
 	}
+	if len(caller.requests) != 1 {
+		t.Fatalf("expected explicit zero count to skip reset credits fallback, got %d requests", len(caller.requests))
+	}
+}
+
+func TestCodexProviderResolvesFallbackResetCreditCount(t *testing.T) {
+	for _, tc := range []struct{ name, usage, details string }{
+		{"explicit count", `{"plan_type":"plus","rate_limit":{"allowed":true},"rate_limit_reset_credits":{}}`, `{"available_count":1,"credits":[{"id":"credit-1","reset_type":"codex_rate_limits","status":"available","expires_at":"2026-09-30T00:00:00Z"}]}`},
+		{"count from details", `{"plan_type":"plus","rate_limit":{"allowed":true}}`, `{"credits":[{"id":"credit-1","reset_type":"codex_rate_limits","status":"available","expires_at":"2026-09-30T00:00:00Z"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			caller := &recordingManagementCaller{responses: []*apicall.Response{quotaAPIResponse(200, tc.usage), quotaAPIResponse(200, tc.details)}}
+			provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
+			output, err := provider.Check(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{Identity: "codex-auth"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := output.Result.(quota.CodexResult)
+			if result.Usage == nil || result.Usage.RateLimitResetCredits == nil || result.Usage.RateLimitResetCredits.AvailableCount == nil || *result.Usage.RateLimitResetCredits.AvailableCount != 1 {
+				t.Fatalf("expected one available fallback credit, got %#v", result.Usage)
+			}
+			if len(caller.requests) != 2 || caller.requests[1].URL != quota.CodexRateLimitResetCreditsURL {
+				t.Fatalf("unexpected fallback requests: %+v", caller.requests)
+			}
+		})
+	}
+}
+
+func TestCodexProviderKeepsUsageWhenResetCreditFallbackFails(t *testing.T) {
+	usageJSON := `{"plan_type":"plus","rate_limit":{"allowed":true,"primary_window":{"used_percent":12,"limit_window_seconds":18000}}}`
+	errorJSON := `{"error":{"message":"reset credits unavailable"}}`
+	caller := &recordingManagementCaller{responses: []*apicall.Response{
+		quotaAPIResponse(200, usageJSON),
+		quotaAPIResponse(503, errorJSON),
+	}}
+	provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
+
+	output, err := provider.Check(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{Identity: "codex-auth"}})
+	if err != nil {
+		t.Fatalf("expected reset credits fallback failure not to discard usage, got %v", err)
+	}
+	result := output.Result.(quota.CodexResult)
+	if result.Usage == nil || result.Usage.RateLimit == nil || result.Usage.RateLimit.PrimaryWindow == nil || result.Usage.RateLimit.PrimaryWindow.UsedPercent != 12 {
+		t.Fatalf("expected primary usage to survive fallback failure, got %#v", result.Usage)
+	}
+	if result.Usage.RateLimitResetCredits != nil {
+		t.Fatalf("expected unknown reset credits after failed fallback, got %#v", result.Usage.RateLimitResetCredits)
+	}
 }
 
 func TestCodexProviderListsAvailableRateLimitResetCredits(t *testing.T) {
 	payload := `{"available_count":2,"credits":[{"id":"credit-1","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-07-01T00:00:00Z","expires_at":"2026-07-20T00:00:00Z"},{"id":"credit-2","resetType":"codex_rate_limits","status":"available","grantedAt":"2026-07-02T00:00:00Z","expiresAt":"2026-07-21T00:00:00Z"},{"id":"used-credit","reset_type":"codex_rate_limits","status":"consumed","expires_at":"2026-07-22T00:00:00Z"},{"id":"other-credit","reset_type":"other","status":"available","expires_at":"2026-07-23T00:00:00Z"}]}`
-	caller := &recordingManagementCaller{responses: []*apicall.Response{{
-		StatusCode: 200,
-		BodyText:   payload,
-		Body:       json.RawMessage(payload),
-	}}}
+	caller := &recordingManagementCaller{responses: []*apicall.Response{quotaAPIResponse(200, payload)}}
 	provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
 	lister, ok := provider.(quota.ProviderResetCreditLister)
 	if !ok {
@@ -124,7 +160,7 @@ func TestCodexProviderListsAvailableRateLimitResetCredits(t *testing.T) {
 
 	output, err := lister.ListResetCredits(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{
 		Identity:  "codex-auth",
-		AccountID: stringPtr("acct_123"),
+		AccountID: new("acct_123"),
 	}})
 	if err != nil {
 		t.Fatalf("ListResetCredits returned error: %v", err)
@@ -194,11 +230,7 @@ func TestCodexProviderPreservesUnknownRateLimitResetCreditCount(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			caller := &recordingManagementCaller{responses: []*apicall.Response{{
-				StatusCode: 200,
-				BodyText:   tt.payload,
-				Body:       json.RawMessage(tt.payload),
-			}}}
+			caller := &recordingManagementCaller{responses: []*apicall.Response{quotaAPIResponse(200, tt.payload)}}
 			provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
 			lister := provider.(quota.ProviderResetCreditLister)
 
@@ -228,11 +260,7 @@ func TestCodexProviderPreservesUnknownRateLimitResetCreditCount(t *testing.T) {
 
 func TestCodexProviderOmitsRateLimitResetCreditsWhenAvailableCountMissing(t *testing.T) {
 	codexUsageJSON := `{"plan_type":"plus","rate_limit":{"allowed":true,"limit_reached":false},"rate_limit_reset_credits":{}}`
-	caller := &recordingManagementCaller{responses: []*apicall.Response{{
-		StatusCode: 200,
-		BodyText:   codexUsageJSON,
-		Body:       json.RawMessage(codexUsageJSON),
-	}}}
+	caller := &recordingManagementCaller{responses: []*apicall.Response{quotaAPIResponse(200, codexUsageJSON)}}
 	provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
 
 	output, err := provider.Check(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{Identity: "codex-auth"}})
@@ -250,11 +278,7 @@ func TestCodexProviderOmitsRateLimitResetCreditsWhenAvailableCountMissing(t *tes
 
 func TestCodexProviderPreservesProWindowUsageFields(t *testing.T) {
 	codexUsageJSON := `{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":13422,"reset_at":1780331042,"window_usage_tokens":11368055,"window_usage_cost":14.83442025},"secondary_window":{"used_percent":15,"limit_window_seconds":604800,"reset_after_seconds":528051,"reset_at":1780845672,"window_usage_tokens":623087989,"window_usage_cost":614.6869810999999}},"additional_rate_limits":[{"limit_name":"GPT-5.3-Codex-Spark","metered_feature":"codex_bengalfox","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":17698,"reset_at":1780335318,"window_usage_tokens":393311,"window_usage_cost":0.458464},"secondary_window":{"used_percent":0,"limit_window_seconds":604800,"reset_after_seconds":568595,"reset_at":1780886215,"window_usage_tokens":418184136,"window_usage_cost":405.1611734}}}]}`
-	caller := &recordingManagementCaller{responses: []*apicall.Response{{
-		StatusCode: 200,
-		BodyText:   codexUsageJSON,
-		Body:       json.RawMessage(codexUsageJSON),
-	}}}
+	caller := &recordingManagementCaller{responses: []*apicall.Response{quotaAPIResponse(200, codexUsageJSON)}}
 	provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
 
 	output, err := provider.Check(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{Identity: "codex-pro-auth"}})
@@ -263,16 +287,16 @@ func TestCodexProviderPreservesProWindowUsageFields(t *testing.T) {
 	}
 	rows := quota.NormalizeQuotaRows(output)
 
-	primary := findCodexQuotaRow(t, rows, "rate_limit.primary_window")
+	primary := findQuotaRow(t, rows, "rate_limit.primary_window")
 	assertWindowUsage(t, primary, 11368055, 14.83442025)
-	secondary := findCodexQuotaRow(t, rows, "rate_limit.secondary_window")
+	secondary := findQuotaRow(t, rows, "rate_limit.secondary_window")
 	assertWindowUsage(t, secondary, 623087989, 614.6869810999999)
-	additional := findCodexQuotaRow(t, rows, "additional_rate_limits.GPT-5.3-Codex-Spark.primary_window")
+	additional := findQuotaRow(t, rows, "additional_rate_limits.GPT-5.3-Codex-Spark.primary_window")
 	assertWindowUsage(t, additional, 393311, 0.458464)
 	if additional.Scope != "additional" || additional.Metric != "codex_bengalfox" {
 		t.Fatalf("expected additional row metadata to survive normalization, got %#v", additional)
 	}
-	additionalSecondary := findCodexQuotaRow(t, rows, "additional_rate_limits.GPT-5.3-Codex-Spark.secondary_window")
+	additionalSecondary := findQuotaRow(t, rows, "additional_rate_limits.GPT-5.3-Codex-Spark.secondary_window")
 	assertWindowUsage(t, additionalSecondary, 418184136, 405.1611734)
 	if additionalSecondary.Scope != "additional" || additionalSecondary.Metric != "codex_bengalfox" {
 		t.Fatalf("expected additional secondary row metadata to survive normalization, got %#v", additionalSecondary)
@@ -281,11 +305,7 @@ func TestCodexProviderPreservesProWindowUsageFields(t *testing.T) {
 
 func TestCodexProviderTreatsNullWindowUsageAsMissingAndPreservesCamelCaseZero(t *testing.T) {
 	codexUsageJSON := `{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":0,"limit_window_seconds":18000,"window_usage_tokens":null,"window_usage_cost":null},"secondary_window":{"used_percent":0,"limit_window_seconds":604800,"windowUsageTokens":0,"windowUsageCost":0}}}`
-	caller := &recordingManagementCaller{responses: []*apicall.Response{{
-		StatusCode: 200,
-		BodyText:   codexUsageJSON,
-		Body:       json.RawMessage(codexUsageJSON),
-	}}}
+	caller := &recordingManagementCaller{responses: []*apicall.Response{quotaAPIResponse(200, codexUsageJSON)}}
 	provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
 
 	output, err := provider.Check(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{Identity: "codex-pro-auth"}})
@@ -294,45 +314,42 @@ func TestCodexProviderTreatsNullWindowUsageAsMissingAndPreservesCamelCaseZero(t 
 	}
 	rows := quota.NormalizeQuotaRows(output)
 
-	primary := findCodexQuotaRow(t, rows, "rate_limit.primary_window")
+	primary := findQuotaRow(t, rows, "rate_limit.primary_window")
 	if primary.WindowUsageTokens != nil || primary.WindowUsageCost != nil {
 		t.Fatalf("expected null provider window usage to stay missing, got tokens=%#v cost=%#v", primary.WindowUsageTokens, primary.WindowUsageCost)
 	}
-	secondary := findCodexQuotaRow(t, rows, "rate_limit.secondary_window")
+	secondary := findQuotaRow(t, rows, "rate_limit.secondary_window")
 	assertWindowUsage(t, secondary, 0, 0)
 }
 
 func TestCodexProviderOmitsAccountIDHeaderWhenMissing(t *testing.T) {
-	caller := &recordingManagementCaller{responses: []*apicall.Response{{
-		StatusCode: 200,
-		BodyText:   `{"plan_type":"plus","rate_limit":{"allowed":true,"limit_reached":false}}`,
-		Body:       json.RawMessage(`{"plan_type":"plus","rate_limit":{"allowed":true,"limit_reached":false}}`),
-	}}}
+	caller := &recordingManagementCaller{responses: []*apicall.Response{
+		quotaAPIResponse(200, `{"plan_type":"plus","rate_limit":{"allowed":true,"limit_reached":false}}`),
+		quotaAPIResponse(200, `{"available_count":0}`),
+	}}
 	provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
 
 	_, err := provider.Check(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{Identity: "codex-auth"}})
 	if err != nil {
 		t.Fatalf("Check returned error: %v", err)
 	}
-	if len(caller.requests) != 1 {
-		t.Fatalf("expected one api-call request without account_id, got %d", len(caller.requests))
+	if len(caller.requests) != 2 {
+		t.Fatalf("expected usage and reset-credit requests without account_id, got %d", len(caller.requests))
 	}
-	if _, ok := caller.requests[0].Header["Chatgpt-Account-Id"]; ok {
-		t.Fatalf("expected account id header to be omitted, got headers: %+v", caller.requests[0].Header)
+	for _, request := range caller.requests {
+		if _, ok := request.Header["Chatgpt-Account-Id"]; ok {
+			t.Fatalf("expected account id header to be omitted, got headers: %+v", request.Header)
+		}
 	}
 }
 
 func TestCodexProviderRejectsNonSuccessUsageResponse(t *testing.T) {
-	caller := &recordingManagementCaller{responses: []*apicall.Response{{
-		StatusCode: 429,
-		BodyText:   `{"error":{"message":"rate limited"}}`,
-		Body:       json.RawMessage(`{"error":{"message":"rate limited"}}`),
-	}}}
+	caller := &recordingManagementCaller{responses: []*apicall.Response{quotaAPIResponse(429, `{"error":{"message":"rate limited"}}`)}}
 	provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
 
 	_, err := provider.Check(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{
 		Identity:  "codex-auth",
-		AccountID: stringPtr("acct_123"),
+		AccountID: new("acct_123"),
 	}})
 	if err == nil || err.Error() != "HTTP 429: rate limited" {
 		t.Fatalf("expected target HTTP message, got %v", err)
@@ -341,11 +358,7 @@ func TestCodexProviderRejectsNonSuccessUsageResponse(t *testing.T) {
 
 func TestCodexProviderConsumesRateLimitResetCredit(t *testing.T) {
 	resetJSON := `{"code":"reset","windows_reset":2}`
-	caller := &recordingManagementCaller{responses: []*apicall.Response{{
-		StatusCode: 200,
-		BodyText:   resetJSON,
-		Body:       json.RawMessage(resetJSON),
-	}}}
+	caller := &recordingManagementCaller{responses: []*apicall.Response{quotaAPIResponse(200, resetJSON)}}
 	provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
 	resetter, ok := provider.(quota.ProviderResetter)
 	if !ok {
@@ -354,7 +367,7 @@ func TestCodexProviderConsumesRateLimitResetCredit(t *testing.T) {
 
 	output, err := resetter.Reset(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{
 		Identity:  "codex-auth",
-		AccountID: stringPtr("acct_123"),
+		AccountID: new("acct_123"),
 	}})
 	if err != nil {
 		t.Fatalf("Reset returned error: %v", err)
@@ -382,63 +395,27 @@ func TestCodexProviderConsumesRateLimitResetCredit(t *testing.T) {
 	}
 }
 
-func TestCodexProviderRejectsNonSuccessResetResponse(t *testing.T) {
-	caller := &recordingManagementCaller{responses: []*apicall.Response{{
-		StatusCode: 429,
-		BodyText:   `{"error":{"message":"rate limited"}}`,
-		Body:       json.RawMessage(`{"error":{"message":"rate limited"}}`),
-	}}}
-	provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
-	resetter, ok := provider.(quota.ProviderResetter)
-	if !ok {
-		t.Fatalf("expected codex provider to implement ProviderResetter")
-	}
-
-	_, err := resetter.Reset(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{Identity: "codex-auth"}})
-	if err == nil || err.Error() != "HTTP 429: rate limited" {
-		t.Fatalf("expected target HTTP message, got %v", err)
-	}
-}
-
-func TestCodexProviderRejectsMalformedResetResponse(t *testing.T) {
-	cases := []struct {
-		name string
-		body string
+func TestCodexProviderRejectsResetResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		status             int
+		body, errorMessage string
 	}{
-		{name: "empty object", body: `{}`},
-		{name: "non reset code", body: `{"code":"noop","windows_reset":2}`},
-		{name: "missing windows reset", body: `{"code":"reset"}`},
-	}
-	for _, tc := range cases {
+		{"non-success", 429, `{"error":{"message":"rate limited"}}`, "HTTP 429: rate limited"},
+		{"empty object", 200, `{}`, ""},
+		{"non reset code", 200, `{"code":"noop","windows_reset":2}`, ""},
+		{"missing windows reset", 200, `{"code":"reset"}`, ""},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			caller := &recordingManagementCaller{responses: []*apicall.Response{{
-				StatusCode: 200,
-				BodyText:   tc.body,
-				Body:       json.RawMessage(tc.body),
-			}}}
+			caller := &recordingManagementCaller{responses: []*apicall.Response{quotaAPIResponse(tc.status, tc.body)}}
 			provider := quota.NewCodexProvider(caller, quota.DefaultProviderConfigs().Codex)
-			resetter, ok := provider.(quota.ProviderResetter)
-			if !ok {
-				t.Fatalf("expected codex provider to implement ProviderResetter")
-			}
-
+			resetter := provider.(quota.ProviderResetter)
 			_, err := resetter.Reset(context.Background(), quota.ProviderInput{Identity: entities.UsageIdentity{Identity: "codex-auth"}})
-			if err == nil {
-				t.Fatalf("expected malformed reset response to return error")
+			if err == nil || (tc.errorMessage != "" && err.Error() != tc.errorMessage) {
+				t.Fatalf("unexpected reset error: %v", err)
 			}
 		})
 	}
-}
-
-func findCodexQuotaRow(t *testing.T, rows []quota.QuotaRow, key string) quota.QuotaRow {
-	t.Helper()
-	for _, row := range rows {
-		if row.Key == key {
-			return row
-		}
-	}
-	t.Fatalf("missing quota row %q in %#v", key, rows)
-	return quota.QuotaRow{}
 }
 
 func assertWindowUsage(t *testing.T, row quota.QuotaRow, tokens int64, cost float64) {
@@ -446,7 +423,7 @@ func assertWindowUsage(t *testing.T, row quota.QuotaRow, tokens int64, cost floa
 	if row.WindowUsageTokens == nil || *row.WindowUsageTokens != tokens {
 		t.Fatalf("expected %s window usage tokens %d, got %#v", row.Key, tokens, row.WindowUsageTokens)
 	}
-	if row.WindowUsageCost == nil || math.Abs(*row.WindowUsageCost-cost) > 0.000000001 {
+	if row.WindowUsageCost == nil || !(math.Abs(*row.WindowUsageCost-cost) <= 0.000000001) {
 		t.Fatalf("expected %s window usage cost %.8f, got %#v", row.Key, cost, row.WindowUsageCost)
 	}
 }

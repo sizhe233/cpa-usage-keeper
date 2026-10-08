@@ -33,6 +33,7 @@ type StatusProvider interface {
 
 type QuotaProvider interface {
 	GetCodexQuotaHistory(context.Context, quota.CodexQuotaHistoryRequest) (quota.CodexQuotaHistoryResponse, error)
+	DeleteCodexQuotaHistoryCycle(context.Context, string, int64) error
 	GetCachedQuota(context.Context, quota.CacheRequest) (quota.CacheResponse, error)
 	Refresh(context.Context, quota.RefreshRequest) (quota.RefreshResponse, error)
 	GetRefreshTaskByAuthIndex(context.Context, string) (quota.RefreshTaskResponse, error)
@@ -50,15 +51,17 @@ type StatusRouteConfig struct {
 }
 
 type OptionalProviders struct {
-	UsageIdentity service.UsageIdentityProvider
-	ErrorEvents   service.ErrorEventProvider
-	Quota         QuotaProvider
-	CPAAPIKeys    service.CPAAPIKeyProvider
-	AuthFiles     service.AuthFilesManagementProvider
-	RequestLogs   service.RequestLogProvider
-	Ranking       rankinghttpapi.Provider
-	LocalRanking  rankinghttpapi.LocalProvider
-	Status        StatusRouteConfig
+	UsageIdentity      service.UsageIdentityProvider
+	ErrorEvents        service.ErrorEventProvider
+	Quota              QuotaProvider
+	CPAAPIKeys         service.CPAAPIKeyProvider
+	AuthFiles          service.AuthFilesManagementProvider
+	CredentialStatus   service.CredentialStatusProvider
+	CredentialPriority service.CredentialPriorityProvider
+	RequestLogs        service.RequestLogProvider
+	Ranking            rankinghttpapi.Provider
+	LocalRanking       rankinghttpapi.LocalProvider
+	Status             StatusRouteConfig
 }
 
 func NewRouter(
@@ -100,6 +103,8 @@ func NewRouter(
 	var quotaProvider QuotaProvider
 	var cpaAPIKeyProvider service.CPAAPIKeyProvider
 	var authFilesProvider service.AuthFilesManagementProvider
+	var credentialStatusProvider service.CredentialStatusProvider
+	var credentialPriorityProvider service.CredentialPriorityProvider
 	var requestLogProvider service.RequestLogProvider
 	var rankingProvider rankinghttpapi.Provider
 	var localRankingProvider rankinghttpapi.LocalProvider
@@ -110,6 +115,8 @@ func NewRouter(
 		quotaProvider = optionalProviders[0].Quota
 		cpaAPIKeyProvider = optionalProviders[0].CPAAPIKeys
 		authFilesProvider = optionalProviders[0].AuthFiles
+		credentialStatusProvider = optionalProviders[0].CredentialStatus
+		credentialPriorityProvider = optionalProviders[0].CredentialPriority
 		requestLogProvider = optionalProviders[0].RequestLogs
 		rankingProvider = optionalProviders[0].Ranking
 		localRankingProvider = optionalProviders[0].LocalRanking
@@ -135,6 +142,8 @@ func NewRouter(
 	registerUsageIdentityRoutes(adminProtected, usageIdentityProvider)
 	registerErrorEventRoutes(adminProtected, errorEventProvider)
 	registerAuthFileManagementRoutes(adminProtected, authFilesProvider)
+	registerCredentialStatusRoutes(adminProtected, credentialStatusProvider)
+	registerCredentialPriorityRoutes(adminProtected, credentialPriorityProvider)
 	registerAuthSessionManagementRoutes(adminProtected, authHandler)
 	registerCPAAPIKeyRoutes(adminProtected, cpaAPIKeyProvider)
 	registerPricingRoutes(adminProtected, pricingProvider)
