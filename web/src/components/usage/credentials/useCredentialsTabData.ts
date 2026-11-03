@@ -12,7 +12,7 @@ import { useQuotaCache } from './useQuotaCache'
 import { useQuotaInspection } from './useQuotaInspection'
 import { ApiError, resetUsageQuota, setCredentialDisabled, setCredentialPriority, updateUsageIdentityAlias, type CredentialStatusKind, type UsageIdentityPageSort } from '@/lib/api'
 import i18n from '@/i18n'
-import type { UsageIdentity, UsageIdentityTypeCount, UsageQuotaCheckResponse, UsageQuotaInspectionStatusResponse, UsageQuotaResetResponse } from '@/lib/types'
+import type { UsageIdentity, UsageIdentityTypeCount, UsageQuotaInspectionStatusResponse, UsageQuotaResetResponse } from '@/lib/types'
 import { quotaRefreshDisplayError, useQuotaRefreshTasks, type QuotaState } from './useQuotaRefreshTasks'
 import type { CredentialProviderFilterKey } from './credentialProviderFilters'
 
@@ -119,7 +119,7 @@ export function useCredentialsTabData({ enabledAuthFiles, enabledAiProviders, on
     () => selectQuotaEligibleAuthIndexes(credentialPages.authFileIdentities),
     [credentialPages.authFileIdentities],
   )
-  const { quotaResponseByAuthIndex, cachedQuotaStateByAuthIndex, setQuotaResponseByAuthIndex, refreshQuotaCache } = useQuotaCache({
+  const { quotaResponseByAuthIndex, quotaStateByAuthIndex, applyRefreshUpdates, refreshQuotaCache } = useQuotaCache({
     enabled: enabledAuthFiles,
     authIndexes: currentAuthIndexes,
     onAuthRequired,
@@ -127,7 +127,8 @@ export function useCredentialsTabData({ enabledAuthFiles, enabledAiProviders, on
   const quotaRefreshTasks = useQuotaRefreshTasks({
     enabled: enabledAuthFiles,
     currentAuthIndexes,
-    setQuotaResponseByAuthIndex,
+    quotaStateByAuthIndex,
+    applyRefreshUpdates,
     onAuthRequired,
   })
   const { refreshQuotaForAuthIndex } = quotaRefreshTasks
@@ -141,8 +142,8 @@ export function useCredentialsTabData({ enabledAuthFiles, enabledAiProviders, on
 
   const quotaResponsesByAuthIndex = useMemo(() => new Map(Object.entries(quotaResponseByAuthIndex)), [quotaResponseByAuthIndex])
   const quotaStates = useMemo(
-    () => buildCredentialQuotaStateMap(cachedQuotaStateByAuthIndex, quotaRefreshTasks.quotaStateByAuthIndex, quotaResponseByAuthIndex, quotaResetStateByAuthIndex),
-    [cachedQuotaStateByAuthIndex, quotaRefreshTasks.quotaStateByAuthIndex, quotaResponseByAuthIndex, quotaResetStateByAuthIndex],
+    () => buildCredentialQuotaStateMap(quotaStateByAuthIndex, quotaResetStateByAuthIndex),
+    [quotaStateByAuthIndex, quotaResetStateByAuthIndex],
   )
 
   const authFileRows = useMemo(
@@ -399,25 +400,20 @@ export function quotaResetDisplayError(): string {
 }
 
 export function buildCredentialQuotaStateMap(
-  cachedQuotaStateByAuthIndex: Record<string, QuotaState>,
   quotaStateByAuthIndex: Record<string, QuotaState>,
-  quotaResponseByAuthIndex: Record<string, UsageQuotaCheckResponse>,
   resetStateByAuthIndex: Record<string, CredentialResetState> = {},
 ): Map<string, CredentialQuotaState> {
-  const mergedStates = { ...cachedQuotaStateByAuthIndex, ...quotaStateByAuthIndex }
   const authIndexes = new Set([
-    ...Object.keys(mergedStates),
+    ...Object.keys(quotaStateByAuthIndex),
     ...Object.keys(resetStateByAuthIndex),
   ])
   return new Map(Array.from(authIndexes).map((authIndex) => {
-    const state = mergedStates[authIndex] ?? {}
+    const state = quotaStateByAuthIndex[authIndex] ?? {}
     const resetState = resetStateByAuthIndex[authIndex] ?? {}
-    const hasCachedQuota = Object.prototype.hasOwnProperty.call(quotaResponseByAuthIndex, authIndex)
-    const staleFailedState = hasCachedQuota && state.refreshStatus === 'failed'
     return [authIndex, {
       quotaLoading: state.loading ?? false,
-      quotaError: staleFailedState ? undefined : state.error,
-      refreshStatus: staleFailedState ? undefined : state.refreshStatus,
+      quotaError: state.error,
+      refreshStatus: state.refreshStatus,
       quotaResetting: resetState.quotaResetting ?? false,
     }]
   }))

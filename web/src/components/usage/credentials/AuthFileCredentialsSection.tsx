@@ -6,7 +6,8 @@ import { LoadingSpinner } from '@/components/ui/LoadingSpinner'
 import { MainActionButton } from '@/components/ui/MainActionButton'
 import { Modal } from '@/components/ui/Modal'
 import { Select } from '@/components/ui/Select'
-import { IconChartLine, IconGaugeReset, IconRefreshCw, IconSearch, IconSettings, IconShield, IconTrash2 } from '@/components/ui/icons'
+import { IconChartLine, IconInfo, IconGaugeReset, IconRefreshCw, IconSearch, IconSettings, IconShield, IconTrash2 } from '@/components/ui/icons'
+import { PortalTooltip, usePortalTooltip } from '@/components/ui/PortalTooltip'
 import quotaCostIcon from '@/assets/icons/quota-cost.svg'
 import quotaTokenIcon from '@/assets/icons/quota-token.svg'
 import styles from './CredentialSections.module.scss'
@@ -2078,8 +2079,9 @@ function QuotaBar({ quota, quotaUsageMode, timeZone, showGroupMetadata = true, t
   return (
     <div className={`${styles.credentialQuotaBarBlock} ${tooltipAlignRight ? styles.credentialQuotaBarTooltipRight : ''}`.trim()}>
       <div className={styles.credentialQuotaBarHeader}>
-        <span className={styles.credentialQuotaLabelGroup}>
+        <span className={`${styles.credentialQuotaLabelGroup} ${quota.usageBreakdown?.length ? styles.credentialQuotaLabelWithInfo : ''}`.trim()}>
           <span>{quota.label}</span>
+          {Boolean(quota.usageBreakdown?.length) && <QuotaUsageBreakdownInfo quota={quota} />}
         </span>
         {(resetDuration || percentLabel) && (
           <span className={styles.credentialQuotaValueGroup}>
@@ -2088,9 +2090,9 @@ function QuotaBar({ quota, quotaUsageMode, timeZone, showGroupMetadata = true, t
           </span>
         )}
       </div>
-      <div className={styles.credentialQuotaTrack}>
+      {!(quota.usageBreakdown?.length && quota.barPercent === null) && <div className={styles.credentialQuotaTrack}>
         <span className={`${styles.credentialQuotaFill} ${credentialToneClassName('credentialQuotaFill', quota.status)}`.trim()} style={{ width }} />
-      </div>
+      </div>}
       <div className={styles.credentialQuotaMeta}>
         {showGroupMetadata && quota.scope === 'quota_group' && quota.groupLabel && (
           <QuotaGroupLabel label={quota.groupLabel} description={quota.groupDescription} />
@@ -2119,6 +2121,57 @@ function QuotaBar({ quota, quotaUsageMode, timeZone, showGroupMetadata = true, t
       </div>
     </div>
   )
+}
+
+function QuotaUsageBreakdownInfo({ quota }: { quota: DisplayQuota }) {
+  const { t } = useTranslation()
+  const tooltipId = useId()
+  const anchorRef = useRef<HTMLButtonElement>(null)
+  const { tooltip, showOnMouseEnter, hideOnMouseLeave, showOnFocus, hideOnBlur, dismiss } = usePortalTooltip()
+  const formatUsed = (value: number | null | undefined) => typeof value === 'number' && Number.isFinite(value)
+    ? `${Math.round(Math.max(0, Math.min(100, value)) * 100) / 100}%`
+    : t('usage_stats.credentials_quota_usage_unknown')
+  const lines = [
+    t('usage_stats.credentials_quota_shared_usage'),
+    `${t('usage_stats.credentials_quota_total_used')}: ${formatUsed(quota.percent)}`,
+    ...(quota.usageBreakdown ?? []).map((item) => `${item.product}: ${formatUsed(item.usedPercent)}`),
+    t('usage_stats.credentials_quota_shared_usage_note'),
+  ]
+
+  useEffect(() => {
+    if (!tooltip) return
+    const closeOutside = (event: PointerEvent) => {
+      if (!anchorRef.current?.contains(event.target as Node)) dismiss()
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') dismiss()
+    }
+    document.addEventListener('pointerdown', closeOutside)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOutside)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [tooltip, dismiss])
+
+  return <>
+    <button
+      ref={anchorRef}
+      type="button"
+      className={styles.credentialQuotaInfoButton}
+      aria-label={t('usage_stats.credentials_quota_shared_usage')}
+      aria-describedby={tooltip ? tooltipId : undefined}
+      onMouseEnter={(event) => showOnMouseEnter(lines, event.currentTarget)}
+      onMouseLeave={(event) => hideOnMouseLeave(event.currentTarget)}
+      onFocus={(event) => showOnFocus(lines, event.currentTarget)}
+      onBlur={(event) => hideOnBlur(event.currentTarget)}
+      onClick={(event) => showOnFocus(lines, event.currentTarget)}
+    >
+      <IconInfo width="1em" height="1em" />
+    </button>
+    {/* 保留浮层位置，文本始终来自当前缓存快照，避免后台刷新后仍显示旧用量。 */}
+    <PortalTooltip tooltip={tooltip ? { ...tooltip, lines } : null} id={tooltipId} />
+  </>
 }
 
 function QuotaGroupLabel({ label, description }: { label: string; description?: string }) {
