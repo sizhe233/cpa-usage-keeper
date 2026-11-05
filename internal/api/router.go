@@ -62,14 +62,18 @@ type OptionalProviders struct {
 	Status             StatusRouteConfig
 }
 
-// newRouterEngine 为启动外壳和完整业务路由装配相同的可信代理与异常恢复设置。
-func newRouterEngine(authConfig AuthConfig) *gin.Engine {
+// newRouterEngine 为启动外壳和完整业务路由装配相同的可信代理、恢复与 API 安全设置。
+// 引擎级中间件也覆盖公开启动状态和 NoRoute，且不能改变静态资源的缓存合同。
+func newRouterEngine(authConfig AuthConfig, basePath string) *gin.Engine {
 	router := gin.New()
 	trustedProxyCIDRs := append([]string{}, loopbackTrustedProxyCIDRs...)
 	trustedProxyCIDRs = append(trustedProxyCIDRs, authConfig.TrustedProxyCIDRs...)
 	_ = router.SetTrustedProxies(trustedProxyCIDRs)
 	router.RemoteIPHeaders = []string{"X-Forwarded-For"}
 	router.Use(logging.NewGinRecovery())
+	router.Use(apiSecurityHeaders(basePath))
+	router.Use(unauthenticatedLoginRequestLimits(basePath))
+	router.Use(apiMutationBodyLimits(basePath))
 	return router
 }
 
@@ -83,14 +87,13 @@ func NewRouter(
 	basePath string,
 	optionalProviders ...OptionalProviders,
 ) *gin.Engine {
-	router := newRouterEngine(authConfig)
+	router := newRouterEngine(authConfig, basePath)
 
 	appGroup := router.Group(basePath)
 	registerHealthRoutes(appGroup, readyStartupStatus)
 
 	apiV1 := appGroup.Group("/api/v1")
 	registerStartupStatusRoute(apiV1, func() StartupStatus { return readyStartupStatus() })
-	apiV1.Use(unauthenticatedLoginRequestLimits(basePath))
 	apiV1.Use(requestIntentMiddleware())
 	if debugAPIRoutesEnabled() {
 		registerPingRoutes(apiV1)

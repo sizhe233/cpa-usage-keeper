@@ -50,7 +50,7 @@ func registerStaticRoutes(router *gin.Engine, appGroup *gin.RouterGroup, staticF
 		}
 		// 探针可能携带未规范化的部署前缀；只把就绪 GET 定向到真实路由，避免 SPA 兜底误报成功。
 		if c.Request.Method == http.MethodGet && requestPath == "/readyz" && c.Request.URL.Path != basePath+"/readyz" {
-			setNoStoreHeaders(c)
+			setAPISecurityHeaders(c.Writer.Header())
 			c.Redirect(http.StatusTemporaryRedirect, basePath+"/readyz")
 			return
 		}

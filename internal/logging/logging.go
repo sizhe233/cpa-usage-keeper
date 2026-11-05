@@ -304,8 +304,11 @@ func newDailyFileWriterWithPrefix(dir, prefix string, retentionDays int, now fun
 		retentionDays: retentionDays,
 		now:           now,
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create log dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("restrict log dir permissions: %w", err)
 	}
 	if err := writer.rotateLocked(now()); err != nil {
 		return nil, err
@@ -391,9 +394,13 @@ func (w *dailyFileWriter) rotateLocked(now time.Time) error {
 		return err
 	}
 	filePath := filepath.Join(w.dir, w.prefix+date+".log")
-	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("open log file: %w", err)
+	}
+	// OpenFile 的 mode 不影响已有文件；升级或重启也必须收紧旧的当日日志。
+	if err := file.Chmod(0o600); err != nil {
+		return errors.Join(fmt.Errorf("restrict log file permissions: %w", err), file.Close())
 	}
 	w.file = file
 	w.currentDate = date

@@ -49,6 +49,7 @@ func TestStartupShellServesPublicStatusAndStaticPageWithoutDatabase(t *testing.T
 			if blocked.Code != http.StatusServiceUnavailable || !strings.Contains(blocked.Body.String(), `"code":"migration_in_progress"`) {
 				t.Fatalf("startup business API: code=%d body=%s", blocked.Code, blocked.Body.String())
 			}
+			assertAPISecurityHeaders(t, blocked)
 			if basePath != "" {
 				outside := requestStartup(t, shell, http.MethodGet, "/api/v1/startup/status")
 				if outside.Code != http.StatusNotFound {
@@ -97,9 +98,11 @@ func TestStartupShellKeepsFailedPageAndAtomicReadySwitch(t *testing.T) {
 	if liveness := requestStartup(t, shell, http.MethodGet, "/healthz"); liveness.Code != http.StatusOK {
 		t.Fatalf("failed shell lost liveness route: code=%d", liveness.Code)
 	}
-	if blocked := requestStartup(t, shell, http.MethodGet, "/api/v1/pricing/models"); blocked.Code != http.StatusServiceUnavailable {
+	blocked := requestStartup(t, shell, http.MethodGet, "/api/v1/pricing/models")
+	if blocked.Code != http.StatusServiceUnavailable {
 		t.Fatalf("failed shell exposed business API: code=%d", blocked.Code)
 	}
+	assertAPISecurityHeaders(t, blocked)
 	if err := shell.ActivateReady(nil); err == nil {
 		t.Fatal("nil full handler activated ready")
 	}
@@ -125,6 +128,52 @@ func TestFullRouterStartupStatusIsPublicAndReady(t *testing.T) {
 	}
 }
 
+func TestStartupAndFullRouterSecurityLimitsCoverMissingAPIRoutes(t *testing.T) {
+	for _, basePath := range []string{"", "/cpa"} {
+		config := api.AuthConfig{Enabled: true, LoginPassword: "secret", BasePath: basePath}
+		shell := api.NewStartupShell(nil, config, basePath)
+		failed := api.NewStartupShell(nil, config, basePath)
+		if err := failed.Publish(api.StartupPhaseFailed, nil); err != nil {
+			t.Fatal(err)
+		}
+		for name, handler := range map[string]http.Handler{
+			"opening": shell,
+			"failed":  failed,
+			"ready":   api.NewRouter(nil, nil, nil, nil, config, nil, basePath),
+		} {
+			t.Run(name+"/base="+basePath, func(t *testing.T) {
+				// 启动壳通过 NoRoute 响应；完整 Router 可能在登录限额处提前返回。
+				for _, endpoint := range []string{"auth/login", "auth/api-key-login", "auth/oidc/login", "unknown"} {
+					size := 4097
+					if endpoint == "unknown" {
+						size = (1 << 20) + 1
+					}
+					resp := httptest.NewRecorder()
+					req := httptest.NewRequest(http.MethodPost, basePath+"/api/v1/"+endpoint, strings.NewReader(strings.Repeat("x", size)))
+					handler.ServeHTTP(resp, req)
+					if resp.Code != http.StatusRequestEntityTooLarge {
+						t.Errorf("%s oversized request: got %d, want 413", endpoint, resp.Code)
+					}
+					assertAPISecurityHeaders(t, resp)
+				}
+				missing := requestStartup(t, handler, http.MethodGet, basePath+"/api/v1/unknown")
+				assertAPISecurityHeaders(t, missing)
+			})
+		}
+	}
+}
+
+func TestUninitializedStartupShellFailureHasSecurityHeaders(t *testing.T) {
+	var nilShell *api.StartupShell
+	for _, shell := range []*api.StartupShell{nilShell, {}} {
+		resp := requestStartup(t, shell, http.MethodGet, "/api/v1/startup/status")
+		if resp.Code != http.StatusServiceUnavailable {
+			t.Fatalf("uninitialized shell status=%d", resp.Code)
+		}
+		assertAPISecurityHeaders(t, resp)
+	}
+}
+
 func requestStartup(t *testing.T, handler http.Handler, method, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	resp := httptest.NewRecorder()
@@ -146,5 +195,21 @@ func assertStartupJSON(t *testing.T, resp *httptest.ResponseRecorder, phase stri
 	}
 	if wantNullProgress && string(value["progress"]) != "null" {
 		t.Fatalf("unknown progress must be null: %s", resp.Body.String())
+	}
+	assertAPISecurityHeaders(t, resp)
+}
+
+func assertAPISecurityHeaders(t *testing.T, resp *httptest.ResponseRecorder) {
+	t.Helper()
+	for name, want := range map[string]string{
+		"Cache-Control":          "no-store",
+		"Pragma":                 "no-cache",
+		"Expires":                "0",
+		"X-Content-Type-Options": "nosniff",
+		"Referrer-Policy":        "no-referrer",
+	} {
+		if got := resp.Header().Get(name); got != want {
+			t.Errorf("%s=%q, want %q (status %d)", name, got, want, resp.Code)
+		}
 	}
 }

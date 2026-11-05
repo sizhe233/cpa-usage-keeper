@@ -11,6 +11,7 @@ import (
 
 const (
 	unauthenticatedLoginBodyLimit   int64 = 4 << 10
+	authenticatedJSONBodyLimit      int64 = 1 << 20
 	unauthenticatedLoginReadTimeout       = 15 * time.Second
 )
 
@@ -46,6 +47,43 @@ func unauthenticatedLoginRequestLimits(basePath string) gin.HandlerFunc {
 			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, unauthenticatedLoginBodyLimit)
 		}
 
+		c.Next()
+	}
+}
+
+func apiSecurityHeaders(basePath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if isAPIRequest(basePath, c.Request.URL.Path) {
+			setAPISecurityHeaders(c.Writer.Header())
+		}
+		c.Next()
+	}
+}
+
+func setAPISecurityHeaders(header http.Header) {
+	header.Set("Cache-Control", "no-store")
+	header.Set("Pragma", "no-cache")
+	header.Set("Expires", "0")
+	header.Set("X-Content-Type-Options", "nosniff")
+	header.Set("Referrer-Policy", "no-referrer")
+}
+
+func isAPIRequest(basePath, requestPath string) bool {
+	path, ok := stripBasePath(basePath, requestPath)
+	return ok && (path == "/api" || strings.HasPrefix(path, "/api/"))
+}
+
+// apiMutationBodyLimits 位于登录限额之后，保证 4 KiB 登录校验和 body 关闭仍在读取期限内。
+func apiMutationBodyLimits(basePath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if isAPIRequest(basePath, c.Request.URL.Path) && c.Request.Body != nil && requiresRequestIntent(c.Request.Method) {
+			if c.Request.ContentLength > authenticatedJSONBodyLimit {
+				writeRequestEntityTooLarge(c)
+				c.Abort()
+				return
+			}
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, authenticatedJSONBodyLimit)
+		}
 		c.Next()
 	}
 }

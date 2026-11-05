@@ -21,9 +21,12 @@ func TestReadinessSeparatesStartupFailureAndRecoveryFromLiveness(t *testing.T) {
 				if ready.Code != http.StatusServiceUnavailable || ready.Header().Get("Cache-Control") != "no-store" || !strings.Contains(ready.Body.String(), `"phase":"`+string(phase)+`"`) {
 					t.Fatalf("%s readiness: code=%d headers=%v body=%s", phase, ready.Code, ready.Header(), ready.Body.String())
 				}
-				if live := requestStartup(t, shell, http.MethodGet, basePath+"/healthz"); live.Code != http.StatusOK {
+				assertAPISecurityHeaders(t, ready)
+				live := requestStartup(t, shell, http.MethodGet, basePath+"/healthz")
+				if live.Code != http.StatusOK {
 					t.Fatalf("%s liveness: %d", phase, live.Code)
 				}
+				assertAPISecurityHeaders(t, live)
 			}
 			full := api.NewRouter(nil, nil, nil, nil, config, nil, basePath)
 			if err := shell.ActivateReady(full); err != nil {
@@ -33,6 +36,7 @@ func TestReadinessSeparatesStartupFailureAndRecoveryFromLiveness(t *testing.T) {
 			if ready.Code != http.StatusOK || !strings.Contains(ready.Body.String(), `"phase":"ready"`) || ready.Header().Get("Cache-Control") != "no-store" {
 				t.Fatalf("recovered readiness: code=%d body=%s", ready.Code, ready.Body.String())
 			}
+			assertAPISecurityHeaders(t, ready)
 			if basePath != "" {
 				if outside := requestStartup(t, shell, http.MethodGet, "/readyz"); outside.Code != http.StatusNotFound {
 					t.Fatalf("readiness escaped base path: %d", outside.Code)
@@ -52,6 +56,7 @@ func TestReadinessRedirectsOnlyNoncanonicalGETProbePaths(t *testing.T) {
 			if resp.Code != http.StatusTemporaryRedirect || resp.Header().Get("Location") != canonical || resp.Header().Get("Cache-Control") != "no-store" {
 				t.Fatalf("noncanonical readiness %s: code=%d headers=%v body=%s", path, resp.Code, resp.Header(), resp.Body.String())
 			}
+			assertAPISecurityHeaders(t, resp)
 		}
 		for _, tc := range []struct{ method, path string }{
 			{http.MethodGet, basePath + "/extra/../dashboard"},

@@ -46,7 +46,7 @@ type StartupShell struct {
 // 普通 API 在切换前返回迁移中；调用方完成数据与运行环境检查后再调用 ActivateReady。
 func NewStartupShell(staticFS fs.FS, authConfig AuthConfig, basePath string) *StartupShell {
 	shell := &StartupShell{}
-	router := newRouterEngine(authConfig)
+	router := newRouterEngine(authConfig, basePath)
 	appGroup := router.Group(basePath)
 	registerHealthRoutes(appGroup, shell.Status)
 	apiV1 := appGroup.Group("/api/v1")
@@ -117,11 +117,13 @@ func (s *StartupShell) Status() StartupStatus {
 // ServeHTTP 为每个请求读取一次外层 handler 指针，保证路由和就绪状态同时切换。
 func (s *StartupShell) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s == nil {
+		setAPISecurityHeaders(w.Header())
 		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	target := s.target.Load()
 	if target == nil {
+		setAPISecurityHeaders(w.Header())
 		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 		return
 	}

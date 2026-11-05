@@ -117,23 +117,32 @@ func TestUnauthenticatedLoginLimitsRunBeforeRequestIntentCheck(t *testing.T) {
 }
 
 func TestKnownOversizedLoginBodyClosesAfterReadDeadline(t *testing.T) {
-	router := newLoginSecurityRouter(nil)
-	writer := newDeadlineTrackingResponseWriter()
-	body := &deadlineCheckingBody{
-		reader:         strings.NewReader("x"),
-		deadlineActive: writer.readDeadlineActive,
-	}
-	request := newLoginRequest("/api/v1/auth/login", "", "198.51.100.26:1234")
-	request.Body = body
-	request.ContentLength = 4097
+	for name, handler := range map[string]http.Handler{
+		"ready":   newLoginSecurityRouter(nil),
+		"startup": keeperapi.NewStartupShell(nil, keeperapi.AuthConfig{}, ""),
+	} {
+		for _, size := range []int64{4097, (1 << 20) + 1} {
+			t.Run(name+"/size="+strconv.FormatInt(size, 10), func(t *testing.T) {
+				writer := newDeadlineTrackingResponseWriter()
+				body := &deadlineCheckingBody{
+					reader:         strings.NewReader("x"),
+					deadlineActive: writer.readDeadlineActive,
+				}
+				request := newLoginRequest("/api/v1/auth/login", "", "198.51.100.26:1234")
+				request.Body = body
+				request.ContentLength = size
 
-	router.ServeHTTP(writer, request)
+				handler.ServeHTTP(writer, request)
 
-	if writer.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("expected oversized login body to return 413, got %d", writer.Code)
-	}
-	if !body.closedWithDeadline {
-		t.Fatal("expected oversized login body to close while the read deadline is active")
+				if writer.Code != http.StatusRequestEntityTooLarge {
+					t.Fatalf("expected oversized login body to return 413, got %d", writer.Code)
+				}
+				if !body.closedWithDeadline {
+					t.Fatal("expected oversized login body to close while the read deadline is active")
+				}
+				assertAPISecurityHeaders(t, writer.ResponseRecorder)
+			})
+		}
 	}
 }
 

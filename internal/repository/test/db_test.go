@@ -60,6 +60,65 @@ func collectRequestEventsForTest(db *gorm.DB, filter dto.UsageQueryFilter, snaps
 	return records, err
 }
 
+func TestOpenDatabaseRestrictsSQLiteFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose POSIX file modes")
+	}
+	openers := map[string]func(config.Config) (*gorm.DB, *gorm.DB, error){
+		"OpenDatabase": func(cfg config.Config) (*gorm.DB, *gorm.DB, error) {
+			writer, err := repository.OpenDatabase(cfg)
+			return writer, writer, err
+		},
+		"OpenDatabaseConnection": func(cfg config.Config) (*gorm.DB, *gorm.DB, error) {
+			writer, err := repository.OpenDatabaseConnection(cfg)
+			return writer, writer, err
+		},
+		"OpenUnmigratedDatabasePools": repository.OpenUnmigratedDatabasePools,
+	}
+	for name, open := range openers {
+		for _, existing := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/existing=%t", name, existing), func(t *testing.T) {
+				dbPath := filepath.Join(t.TempDir(), "app.db")
+				cfg := config.Config{SQLitePath: dbPath}
+				if existing {
+					// 保持旧 writer 活跃，使宽权限 WAL/SHM 确实存在于升级打开路径中。
+					seed, err := repository.OpenDatabase(cfg)
+					if err != nil {
+						t.Fatalf("seed database: %v", err)
+					}
+					closeTestDatabase(t, seed)
+					for _, suffix := range []string{"", "-wal", "-shm"} {
+						if err := os.Chmod(dbPath+suffix, 0o666); err != nil {
+							t.Fatalf("prepare legacy permissions %s: %v", suffix, err)
+						}
+					}
+				}
+				db, reader, err := open(cfg)
+				if err != nil {
+					t.Fatalf("open database: %v", err)
+				}
+				closeTestDatabase(t, db)
+				if reader != db {
+					closeTestDatabase(t, reader)
+				}
+				// 只打开 WAL 模式未必创建 sidecar；真实写入后必须验证二者，不允许跳过。
+				if err := db.Exec("CREATE TABLE permission_probe (id INTEGER)").Error; err != nil {
+					t.Fatalf("activate WAL sidecars: %v", err)
+				}
+				for _, suffix := range []string{"", "-wal", "-shm"} {
+					info, err := os.Stat(dbPath + suffix)
+					if err != nil {
+						t.Fatalf("stat active SQLite file %s: %v", suffix, err)
+					}
+					if got := info.Mode().Perm(); got != 0o600 {
+						t.Errorf("expected active app.db%s mode 0600, got %04o", suffix, got)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestOpenDatabaseCreatesFreshDatabaseFromCurrentSchemaWithoutRunningMigrations(t *testing.T) {
 	logs := captureRepositoryLogs(t)
 	db := openTestDatabase(t)
