@@ -66,6 +66,9 @@ type OptionalProviders struct {
 // 引擎级中间件也覆盖公开启动状态和 NoRoute，且不能改变静态资源的缓存合同。
 func newRouterEngine(authConfig AuthConfig, basePath string) *gin.Engine {
 	router := gin.New()
+	// Gin 的自动路径重定向早于全局中间件；统一交给 NoRoute 在安全校验后处理。
+	router.RedirectTrailingSlash = false
+	router.RedirectFixedPath = false
 	trustedProxyCIDRs := append([]string{}, loopbackTrustedProxyCIDRs...)
 	trustedProxyCIDRs = append(trustedProxyCIDRs, authConfig.TrustedProxyCIDRs...)
 	_ = router.SetTrustedProxies(trustedProxyCIDRs)

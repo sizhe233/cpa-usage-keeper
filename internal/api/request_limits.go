@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -21,7 +22,8 @@ func unauthenticatedLoginRequestLimits(basePath string) gin.HandlerFunc {
 	apiKeyLoginPath := prefix + "api-key-login"
 	oidcLoginPath := prefix + "oidc/login"
 	return func(c *gin.Context) {
-		if c.Request.Method != http.MethodPost || (c.Request.URL.Path != loginPath && c.Request.URL.Path != apiKeyLoginPath && c.Request.URL.Path != oidcLoginPath) {
+		requestPath := cleanURLPath(c.Request.URL.Path)
+		if c.Request.Method != http.MethodPost || (requestPath != loginPath && requestPath != apiKeyLoginPath && requestPath != oidcLoginPath) {
 			c.Next()
 			return
 		}
@@ -45,6 +47,19 @@ func unauthenticatedLoginRequestLimits(basePath string) gin.HandlerFunc {
 		}
 		if c.Request.Body != nil {
 			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, unauthenticatedLoginBodyLimit)
+			// 非规范路径不会执行登录 handler；在 NoRoute 提前返回前也验证未知长度的 body。
+			// 仅有界读取并丢弃，不改写路径或重放请求，读取与关闭都受上面的 deadline 保护。
+			if c.Request.URL.Path != requestPath {
+				if _, err := io.Copy(io.Discard, c.Request.Body); err != nil {
+					if isRequestEntityTooLarge(err) {
+						writeRequestEntityTooLarge(c)
+					} else {
+						c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+					}
+					c.Abort()
+					return
+				}
+			}
 		}
 
 		c.Next()

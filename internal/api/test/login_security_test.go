@@ -146,6 +146,89 @@ func TestKnownOversizedLoginBodyClosesAfterReadDeadline(t *testing.T) {
 	}
 }
 
+func TestTrailingSlashLoginLimitsCoverStartupAndReadyAtEveryBasePath(t *testing.T) {
+	staticFS := testStaticFS(t, map[string]string{"index.html": "<html>must not serve SPA</html>"})
+	for _, basePath := range []string{"", "/cpa"} {
+		config := keeperapi.AuthConfig{Enabled: true, LoginPassword: "secret", BasePath: basePath}
+		for name, handler := range map[string]http.Handler{
+			"startup": keeperapi.NewStartupShell(staticFS, config, basePath),
+			"ready":   keeperapi.NewRouter(staticFS, nil, nil, nil, config, nil, basePath),
+		} {
+			for _, endpoint := range []string{"login", "api-key-login", "oidc/login"} {
+				for _, size := range []int{4096, 4097, (1 << 20) + 1} {
+					for _, chunked := range []bool{false, true} {
+						t.Run(name+"/base="+basePath+"/"+endpoint+"/size="+strconv.Itoa(size)+"/chunked="+strconv.FormatBool(chunked), func(t *testing.T) {
+							writer := newDeadlineTrackingResponseWriter()
+							body := &deadlineCheckingBody{reader: strings.NewReader(strings.Repeat("x", size)), deadlineActive: writer.readDeadlineActive}
+							request := newLoginRequest(basePath+"/api/v1/auth/"+endpoint+"/?source=a%2Fb", "", "198.51.100.51:1234")
+							request.Body = body
+							request.ContentLength = int64(size)
+							if chunked {
+								request.ContentLength = -1
+							}
+							// 缺少 request intent 也必须先建立 deadline、执行限额和关闭 body。
+							request.Header.Del(requestIntentHeaderName)
+							handler.ServeHTTP(writer, request)
+							want := http.StatusRequestEntityTooLarge
+							location := ""
+							if size == 4096 {
+								want = http.StatusServiceUnavailable
+								if name == "ready" {
+									want = http.StatusTemporaryRedirect
+									location = basePath + "/api/v1/auth/" + endpoint + "?source=a%2Fb"
+								}
+							}
+							if writer.Code != want || writer.Header().Get("Location") != location {
+								t.Fatalf("login limits: code=%d want=%d headers=%v", writer.Code, want, writer.Header())
+							}
+							if !writer.sawReadDeadline || !body.closedWithDeadline || body.closeCalls != 1 || writer.readDeadlineActive() || body.readWithoutDeadline {
+								t.Fatalf("deadline/body lifecycle: writer=%+v body=%+v", writer, body)
+							}
+							if body.readBytes > 4097 || !chunked && size > 4096 && body.readBytes != 0 {
+								t.Fatalf("login body read was not bounded: %d bytes", body.readBytes)
+							}
+							assertAPISecurityHeaders(t, writer.ResponseRecorder)
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestTrailingSlashLoginRedirectDoesNotReplayAuthentication(t *testing.T) {
+	for _, basePath := range []string{"", "/cpa"} {
+		t.Run("base="+basePath, func(t *testing.T) {
+			provider := &countingCPAAPIKeyProvider{findErr: errors.New("not found")}
+			router := newLoginSecurityRouterWithBasePath(provider, basePath)
+			for _, endpoint := range []struct{ path, body string }{
+				{"login", `{"password":"secret"}`},
+				{"api-key-login", `{"apiKey":"missing"}`},
+				{"oidc/login", `{}`},
+			} {
+				for range 6 {
+					response := performLoginRequest(router, basePath+"/api/v1/auth/"+endpoint.path+"/", endpoint.body, "198.51.100.52:1234")
+					if response.Code != http.StatusTemporaryRedirect || len(response.Result().Cookies()) != 0 {
+						t.Fatalf("redirect ran authentication handler: code=%d headers=%v", response.Code, response.Header())
+					}
+					assertAPISecurityHeaders(t, response)
+				}
+			}
+			if provider.findCalls != 0 {
+				t.Fatalf("API key lookup ran before redirect: %d calls", provider.findCalls)
+			}
+			password := performLoginRequest(router, basePath+"/api/v1/auth/login", `{"password":"secret"}`, "198.51.100.52:1234")
+			if password.Code != http.StatusOK && password.Code != http.StatusNoContent {
+				t.Fatalf("redirect consumed login allowance: %d", password.Code)
+			}
+			apiKey := performLoginRequest(router, basePath+"/api/v1/auth/api-key-login", `{"apiKey":"missing"}`, "198.51.100.52:1234")
+			if apiKey.Code != http.StatusUnauthorized || provider.findCalls != 1 {
+				t.Fatalf("canonical API key login should execute once: code=%d calls=%d", apiKey.Code, provider.findCalls)
+			}
+		})
+	}
+}
+
 func TestTrustedProxySeparatesLoginAttemptSources(t *testing.T) {
 	for _, tc := range []struct {
 		name, remoteAddr, otherAddr, lastAddr string
@@ -292,16 +375,25 @@ func (w *deadlineTrackingResponseWriter) readDeadlineActive() bool {
 }
 
 type deadlineCheckingBody struct {
-	reader             io.Reader
-	deadlineActive     func() bool
-	closedWithDeadline bool
+	reader              io.Reader
+	deadlineActive      func() bool
+	closedWithDeadline  bool
+	readWithoutDeadline bool
+	readBytes           int
+	closeCalls          int
 }
 
 func (b *deadlineCheckingBody) Read(buffer []byte) (int, error) {
-	return b.reader.Read(buffer)
+	if !b.deadlineActive() {
+		b.readWithoutDeadline = true
+	}
+	n, err := b.reader.Read(buffer)
+	b.readBytes += n
+	return n, err
 }
 
 func (b *deadlineCheckingBody) Close() error {
+	b.closeCalls++
 	b.closedWithDeadline = b.deadlineActive()
 	return nil
 }
